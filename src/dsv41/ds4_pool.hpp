@@ -7,6 +7,7 @@
 #pragma once
 
 #include <atomic>
+#include <cstdlib>
 #include <chrono>
 #include <condition_variable>
 #include <cstdint>
@@ -204,7 +205,7 @@ private:
             if (j.mem != nullptr) {
                 std::memcpy(j.dst, j.mem, (size_t) j.len);
                 ok = true;
-            } else if (j.dfd != os::kBadFd && !(j.map != nullptr && os::resident(j.map, (size_t) j.len)) &&
+            } else if (j.dfd != os::kBadFd && !(j.map != nullptr && os::resident(j.map, (size_t) j.len, nearfull_buffered_ ? 90 : 100)) &&
                        os::pread_direct(j.dfd, j.dst, j.len, j.off)) {   // (the page cache's ones: buffered, below)
                 ok = true;
                 direct_.fetch_add(j.len, std::memory_order_relaxed);
@@ -232,6 +233,9 @@ private:
     uint64_t done_ = 0;
     bool quit_ = false;
     std::atomic<uint64_t> busy_us_{0}, direct_{0}, buffered_{0};
+    // Opt-in only: avoid rereading a mostly cached range through O_DIRECT.
+    const bool nearfull_buffered_ = std::getenv("DS4_IO_NEARFULL_BUFFERED") &&
+                                    std::atoi(std::getenv("DS4_IO_NEARFULL_BUFFERED")) != 0;
 };
 
 }  // namespace strata::ds4

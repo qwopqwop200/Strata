@@ -23,6 +23,8 @@
 #include "ds4_kernels.cuh"
 #include "ds4_os.hpp"
 #include "ds4_pool.hpp"
+#include "ds4_heat.hpp"
+#include "ds4_cache_scan.hpp"
 #include "ds4_store.hpp"
 #include "ds4_vision.cuh"
 #include "strata/dsv41/exl3_cpu.hpp"
@@ -201,6 +203,27 @@ uint64_t ram_avail() {
         cg = sl == 0 || sl == std::string::npos ? "/" : cg.substr(0, sl);
     }
     return avail;
+}
+
+// the device memory the experts' placement may count on: cudaMemGetInfo's free, but on an integrated NVIDIA GPU on Linux (a DGX Spark's GB10,
+// one memory with the CPU) what the kernel can still give back, MemAvailable less DS4_UMA_HEADROOM_GIB (6): cudaMemGetInfo counts only MemFree
+// there, and the model's files just read fill the page cache (measured on a GB10: 55 GB "free" with 115 GB available).  Not on HIP: a Strix
+// Halo's GPU memory is its carve-out plus the GTT pool, which hipMemGetInfo already counts and MemAvailable may exceed
+size_t uma_free(int dev, size_t fr) {
+#if !defined(_WIN32) && !defined(STRATA_USE_HIP)
+    int integrated = 0;
+    if (cudaDeviceGetAttribute(&integrated, cudaDevAttrIntegrated, dev) != cudaSuccess) {
+        (void) cudaGetLastError();
+        return fr;
+    }
+    if (!integrated) return fr;
+    const char* h = std::getenv("DS4_UMA_HEADROOM_GIB");
+    const uint64_t head = (uint64_t) (h ? std::atof(h) : 6.0) << 30, avail = ram_avail();
+    if (avail != ~uint64_t{0} && avail > head && avail - head > fr) return (size_t) (avail - head);
+#else
+    (void) dev;
+#endif
+    return fr;
 }
 
 float bf16_to_f32(uint16_t b) {
@@ -1048,6 +1071,8 @@ struct Model::Impl {
         int ram = -1;   // (copy_mode, `in` held in RAM) the spare slot `out` is copied into from VRAM
     };
     static constexpr int kMaxSwaps = 8;
+    const bool c_round_robin = std::getenv("DS4_CACHE_ROUND_ROBIN") && std::atoi(std::getenv("DS4_CACHE_ROUND_ROBIN")) != 0;
+    CacheScan cache_scan;
     // the swap rule: a CPU-lane expert in when its heat passes the coldest VRAM one's x margin + bonus; heat x decay
     // every 256 tokens; at most `inflight` swaps under way (DS4_CACHE_MARGIN / _BONUS / _DECAY / _INFLIGHT)
     static float env_f(const char* k, float d) { return std::getenv(k) ? (float) std::atof(std::getenv(k)) : d; }
@@ -1973,6 +1998,17 @@ struct Model::Impl {
             Dev& d = devs[i];
             d.id = ids[i];
             CK(cudaSetDevice(d.id));
+#if defined(__CUDACC__) && !defined(__HIPCC__) && !defined(STRATA_USE_HIP) && !defined(__HIP_PLATFORM_AMD__)
+            // Per-context host wait policy only; preserve the existing default and non-scheduling flags.
+            if (const char* wait = std::getenv("DS4_CUDA_BLOCKING_SYNC"); wait && std::atoi(wait) != 0) {
+                unsigned flags = 0;
+                CK(cudaGetDeviceFlags(&flags));
+                // MapHost is implicit in the runtime API, not a settable flag in its contract.
+                flags = (flags & ~(cudaDeviceScheduleMask | cudaDeviceMapHost)) | cudaDeviceScheduleBlockingSync;
+                CK(cudaSetDeviceFlags(flags));
+                if (o.verbose) std::fprintf(stderr, "ds4: CUDA%d host waits use blocking synchronization\n", d.id);
+            }
+#endif
             CK(cudaStreamCreateWithFlags(&d.st, cudaStreamNonBlocking));
             CK(cudaEventCreateWithFlags(&d.ev, cudaEventDisableTiming));
             if (!x3::prepare(d.st) || (pk.gguf && !gg::prepare(d.st))) {
@@ -1980,6 +2016,7 @@ struct Model::Impl {
                 return false;
             }
             CK(cudaMemGetInfo(&d.free0, &d.total));
+            d.free0 = uma_free(d.id, d.free0);
         }
         // the groups' width: o.tp, less while the experts' blocks do not split in it (a member takes n_ff / tp of each
         // expert: the down's inputs in whole blocks - a GGUF's 256-value types split n_ff 2304 in 1, 3 or 9 parts)
@@ -2742,6 +2779,8 @@ struct Model::Impl {
                 cudaSetDevice(d.id);
                 size_t fr = 0, tot = 0;
                 CK(cudaMemGetInfo(&fr, &tot));
+                fr = uma_free(devs[(size_t) m].id, fr);
+                fr = uma_free(d.id, fr);
                 room += std::max(0.0, (double) fr - (double) ((size_t) o.reserve_mib << 20)) * o.vram_experts;
             }
             for (const Layer& l : L) all += (double) l.blob * l.n_exp;
@@ -3968,7 +4007,7 @@ struct Model::Impl {
                     return false;
                 }
                 if (!dalloc(d, d_mk_embed, te->bytes / 2, err, acct) || !upload(d, *te, d_mk_embed, err) ||
-                    (strata::ds4::markov_head_q8_default(defaults_026())
+                    ((env_tri("DS4_MARKOV_HEAD_Q8") < 0 ? strata::ds4::markov_head_q8_default(defaults_026()) : env_tri("DS4_MARKOV_HEAD_Q8") != 0)
                          ? !mk_head_q8(d, Z + "markov_head.head.weight", d_mk_head_q8, err, acct)
                          : !f16raw(d, Z + "markov_head.head.weight", d_mk_head, err, acct)))   // (0.2.6: the head as F16)
                     return false;
@@ -4274,6 +4313,9 @@ struct Model::Impl {
     // a GGUF's VRAM experts, in file order, by a few threads through pinned staging blobs (the CPU lane's stay in the
     // file: the mapping reads them on first use)
     bool load_experts_mx(std::string& err) {
+        const char* direct_env=std::getenv("DS4_LOAD_DIRECT_COLD");
+        const bool direct_cold=direct_env && std::atoi(direct_env)!=0;
+        std::atomic<uint64_t> direct_bytes{0},buffered_bytes{0},direct_ranges{0};
         struct Job {
             int layer, e;
         };
@@ -4306,7 +4348,20 @@ struct Model::Impl {
                     if (i >= jobs.size() || failed.load()) break;
                     const Layer& l = L[(size_t) jobs[i].layer];
                     const int e = jobs[i].e;
-                    bool ok = stage != nullptr && stage2 != nullptr && read_mx(l, e, stage);
+                    bool ok=stage!=nullptr && stage2!=nullptr;
+                    bool eligible=direct_cold && l.nm==1 && (l.ram.empty() || l.ram[(size_t)e]<0);
+                    if(eligible)for(int r=0;r<3;++r)
+                        eligible=eligible && (size_t)l.mx_file[r]<pk.pfds.size() && pk.pfds[(size_t)l.mx_file[r]]!=os::kBadFd;
+                    if(ok && eligible){
+                        for(int r=0;r<3 && ok;++r){
+                            const auto file=(size_t)l.mx_file[r];const auto n=mx_part_bytes(l,r);
+                            const auto off=l.mx_off[r]+(uint64_t)e*l.mx_stride[r];bool used=false;
+                            ok=os::pread_cached_or_direct(pk.pfds[file],file<pk.dfds.size()?pk.dfds[file]:os::kBadFd,
+                                mx_mat(l,e,r),stage+l.lay.trellis[r],stage2,maxb,n,off,used);
+                            (used?direct_bytes:buffered_bytes).fetch_add(n,std::memory_order_relaxed);
+                            if(used)direct_ranges.fetch_add(1,std::memory_order_relaxed);
+                        }
+                    }else if(ok)ok=read_mx(l,e,stage);
                     for (int m = 0; m < l.nm && ok; ++m) {   // (a group: each member its part)
                         const Layer& x = member(l, m);
                         cudaSetDevice(devs[(size_t) x.dev].id);
@@ -4329,6 +4384,8 @@ struct Model::Impl {
                 if (stage2) cudaFreeHost(stage2);
             });
         for (auto& t : th) t.join();
+        if(direct_cold)std::fprintf(stderr,"ds4 startup-direct-cold direct_bytes=%llu buffered_bytes=%llu direct_ranges=%llu\n",
+            (unsigned long long)direct_bytes.load(),(unsigned long long)buffered_bytes.load(),(unsigned long long)direct_ranges.load());
         if (failed.load()) {
             err = ferr;
             return false;
@@ -4365,6 +4422,12 @@ struct Model::Impl {
                 const uint64_t av = ram_avail();
                 if (av != ~uint64_t{0}) warm_bytes = av > kRamMargin ? std::min<uint64_t>(warm_bytes, av - kRamMargin) : 0;
             }
+        }
+        const char* warm_room = std::getenv("DS4_WARM_ROOM");
+        if (file_experts && !ram_tier && warm_room && std::atoi(warm_room) != 0) {
+            const uint64_t before = warm_bytes, av = ram_avail();
+            warm_bytes = os::warm_limit(warm_bytes, av, kRamMargin);
+            std::fprintf(stderr, "ds4: post-allocation CPU warm budget %.1f -> %.1f GB\n", before / 1e9, warm_bytes / 1e9);
         }
         if (ram_tier && warm_bytes > 0 && !warm.empty()) {
             // chunks of 32 slots up to warm_bytes (all the RAM the rest leaves, kRamMargin kept), one slot kept free for
@@ -4414,14 +4477,42 @@ struct Model::Impl {
         size_t nw = 0;
         for (double b = 0; nw < warm.size() && b + (double) L[(size_t) warm[nw].layer].blob <= (double) warm_bytes; ++nw)
             b += (double) L[(size_t) warm[nw].layer].blob;
+        // Only the discard-only page-cache warmup may skip a read. GPU uploads and RAM copies above still read all bytes.
+        const char* skip_env = std::getenv("DS4_LOAD_SKIP_WARM_CACHED");
+        const bool skip_warm_cached = file_experts && !copy_mode && skip_env && std::atoi(skip_env) != 0;
+        const char* warm_stats_env = std::getenv("DS4_LOAD_WARM_STATS");
+        const bool warm_stats = skip_warm_cached || (warm_stats_env && std::atoi(warm_stats_env) != 0);
+        const double warm_t0 = warm_stats ? now_ms() : 0;
+        std::atomic<uint64_t> warm_skipped_bytes{0};
+        std::atomic<size_t> warm_skipped_jobs{0};
         std::atomic<size_t> wi{0};
         std::vector<std::thread> wt;
         for (int t = 0; t < 12 && nw > 0; ++t)
             wt.emplace_back([&] {
                 std::vector<uint8_t> buf(maxb);
-                for (size_t i; (i = wi.fetch_add(1)) < nw;) read_mx(L[(size_t) warm[i].layer], warm[i].e, buf.data());
+                uint64_t skipped_bytes = 0;
+                size_t skipped_jobs = 0;
+                for (size_t i; (i = wi.fetch_add(1)) < nw;) {
+                    const Layer& l = L[(size_t) warm[i].layer];
+                    const int e = warm[i].e;
+                    bool cached = skip_warm_cached;
+                    for (int r = 0; r < 3 && cached; ++r)
+                        cached = os::resident(pk.at(l.mx_file[r], l.mx_off[r] + (uint64_t) e * l.mx_stride[r]),
+                                              mx_part_bytes(l, r));
+                    if (cached) {
+                        ++skipped_jobs;
+                        for (int r = 0; r < 3; ++r) skipped_bytes += mx_part_bytes(l, r);
+                    } else {
+                        read_mx(l, e, buf.data());
+                    }
+                }
+                if (warm_stats) { warm_skipped_bytes.fetch_add(skipped_bytes); warm_skipped_jobs.fetch_add(skipped_jobs); }
             });
         for (auto& t : wt) t.join();
+        if (warm_stats)
+            std::fprintf(stderr, "ds4: warm-only skip_cached=%d jobs=%zu skipped=%zu skipped_bytes=%llu wall_ms=%.3f\n",
+                         skip_warm_cached ? 1 : 0, nw, warm_skipped_jobs.load(),
+                         (unsigned long long) warm_skipped_bytes.load(), now_ms() - warm_t0);
         if (o.verbose && nw > 0)
             std::fprintf(stderr, "ds4: %zu CPU-lane experts read ahead (%.1f GB) in %.1f s\n", nw,
                          nw * (double) L[0].blob / 1e9, (now_ms() - t0) / 1000.0);
@@ -5122,7 +5213,9 @@ struct Model::Impl {
                 c.resize(c.size() - (size_t) lane_free);
             int nw = (int) c.size();
             if (o.cpu_threads > 0) nw = std::max(X == 0 ? 0 : 1, std::min(nw, o.cpu_threads / NH - (X == 0 ? 1 : 0)));
-            pools.push_back(std::make_unique<Pool>(nw, c, 20000));   // spin through a token's layers (20 ms)
+            const char* spin = std::getenv("DS4_LANE_SPIN_US");
+            const int spin_us = spin ? std::max(0, std::min(20000, std::atoi(spin))) : 20000;
+            pools.push_back(std::make_unique<Pool>(nw, c, spin_us));   // default: spin through a token's layers (20 ms)
         }
         (void) gg::mx_tier();   // (measured here, not on the first token)
         if (o.verbose) {
@@ -5671,6 +5764,7 @@ struct Model::Impl {
         img_tok = tok;
         CK(cudaSetDevice(d.id));
         CK(cudaMemGetInfo(&d.free0, &d.total));   // (the split sees what the tower left)
+        d.free0 = uma_free(d.id, d.free0);
         if (o.verbose)
             std::fprintf(stderr, "ds4: vision tower (%d blocks) on CUDA%d: %.0f MiB, up to %d patches, %.1f s\n",
                          vg.layers, d.id, (double) vt.device_bytes() / (1 << 20), vt.max_patches(),
@@ -5989,7 +6083,10 @@ struct Model::Impl {
     // ... the low-bit ones (ds4_iq's types): as above, through ggml-cpu's dots (gg::iq_cpu_*) - each token's input
     // quantized once to the weight type's activation (Q8_K) in its c_xh row's bytes, then (h whole) its h the same
     void cpu_experts_iq(const Layer& l, const float* x, const std::vector<Ent>& ents, size_t ldx, const int* ord) {
-        constexpr int RB = 64;   // rows a job
+        static const int RB = [] {   // rows a job; opt-in finer scheduling on asymmetric CPUs
+            const char* v = std::getenv("DS4_IQ_JOB_ROWS");
+            return v ? std::max(8, std::min(256, std::atoi(v))) : 64;
+        }();
         const int E = g.dim, FF = g.ff, FFh = FF / NH, Eh = E / NH;
         const int GB = (FFh + RB - 1) / RB, DB = (Eh + RB - 1) / RB, ne = (int) ents.size();
         gg::IqCpu fm;
@@ -6011,7 +6108,12 @@ struct Model::Impl {
                 if (!store && (l.ram.empty() || l.ram[(size_t) en.e] < 0))
                     for (int r = 0; r < 3; ++r) want.push_back({mx_mat(l, en.e, r), mx_part_bytes(l, r)});
             static const bool pf_all = std::getenv("DS4_IQ_PF_COLD") == nullptr || std::atoi(std::getenv("DS4_IQ_PF_COLD")) == 0;
-            if (pf_all) os::prefetch(want);
+            static const size_t demand_chunk = [] {
+                const char* v = std::getenv("DS4_IQ_PREFETCH_KB");
+                return v ? (size_t)std::max(0, std::min(4096, std::atoi(v))) * 1024 : 0;
+            }();
+            if (demand_chunk) os::prefetch_chunked(want, demand_chunk);
+            else if (pf_all) os::prefetch(want);
             else os::prefetch_cold(want);
         }
         // the activations in c_xh's bytes, E 4 apart: token t's (t < kWin) at row t - quantized once, whatever number of
@@ -6611,7 +6713,11 @@ struct Model::Impl {
                 for (float& h : l.heat) h *= c_decay;
         }
         bool queued = false, rqueued = false;
-        for (Layer& l : L) {
+        // Start after the last accepted promotion so a full queue cannot always favor the first layers.
+        const size_t scan_begin = cache_scan.begin(L.size(), c_round_robin);
+        for (size_t i = 0; i < L.size(); ++i) {
+            const size_t li = CacheScan::layer(scan_begin, i, L.size());
+            Layer& l = L[li];
             if (l.cpu_hits.empty()) continue;
             std::vector<int> hits;
             hits.swap(l.cpu_hits);
@@ -6630,6 +6736,7 @@ struct Model::Impl {
                     if (copy_mode && l.ram[(size_t) best] >= 0) sw.ram = copy_spare[(size_t) l.il];   // (-1: none)
                     std::lock_guard<std::mutex> lk(sw_mu);
                     sw_queue.push_back(sw);
+                    cache_scan.queued(li, L.size(), c_round_robin);
                     queued = true;
                 }
             }
@@ -6662,6 +6769,10 @@ struct Model::Impl {
 
     // lookahead's thread: the ranges the CPU lane asked for, read in (os::prefetch) off the lane, which computes
     void prefetch_loop() {
+        const char* pop=std::getenv("DS4_AHEAD_POPULATE_WARM");
+        const bool populate=pop && std::atoi(pop)!=0;
+        const char* wo=std::getenv("DS4_AHEAD_WARM_ONLY");
+        const bool cold_hint=!(wo && std::atoi(wo)!=0);
         std::vector<std::pair<const void*, size_t>> b;
         for (;;) {
             {
@@ -6670,7 +6781,8 @@ struct Model::Impl {
                 if (quit.load(std::memory_order_relaxed)) return;
                 b.swap(pf_q);
             }
-            os::prefetch_cold(b);   // (the resident ones would only cost the page walk)
+            if(populate)os::prefetch_populate_cached(b,cold_hint);
+            else os::prefetch_cold(b);   // original background path, including its default
             b.clear();
         }
     }
@@ -6732,6 +6844,9 @@ struct Model::Impl {
     // the decode path's host side: each published routing in turn - its CPU lane experts (if any) into the answer's
     // part, then the answer's seq.  Spins while requests come (a token's 40 layers), naps after 2 ms without one.
     void serve_lane() {
+        const char* spin = std::getenv("DS4_SERVICE_SPIN_US");
+        const int spin_us = spin ? std::max(0, std::min(20000, std::atoi(spin))) : 2000;
+        if (spin && o.verbose) std::fprintf(stderr, "ds4: CPU service idle spin %d us\n", spin_us);
         unsigned next = 1;
         auto last = std::chrono::steady_clock::now();
         std::vector<Ent> ents;
@@ -6739,7 +6854,7 @@ struct Model::Impl {
             Req& r = reqs[next % kRing];
             if (*(volatile unsigned*) &r.seq != next) {
                 cpu_relax();
-                if (std::chrono::steady_clock::now() - last > std::chrono::milliseconds(2))
+                if (std::chrono::steady_clock::now() - last > std::chrono::microseconds(spin_us))
                     std::this_thread::sleep_for(std::chrono::microseconds(20));
                 continue;
             }
@@ -8706,6 +8821,15 @@ struct Model::Impl {
         if (logits_all) n_logits = (T_last - 1) % kWin + 1;   // (sample() takes the last row of d.logits)
         pos += n;
         st.tokens += n;
+        if (const char* cap = std::getenv("DS4_PROMPT_HEAT_CAP")) {
+            const char* tr = std::getenv("DS4_PROMPT_HEAT_TRIGGER");
+            const double trigger = tr ? std::max(1.0, std::atof(tr)) : 1.0;
+            int changed = 0;
+            for (Layer& l : L)
+                if (!l.mtp && bound_heat(l.heat, std::atof(cap), trigger)) ++changed;
+            if (o.verbose && changed)
+                std::fprintf(stderr, "ds4: prompt cache heat bounded on %d layers to %s\n", changed, cap);
+        }
         cache_tick(n);
         if (lm_end_.on) {   // (the layer cache's RAM back before the store and the swaps want it)
             lm_end();
@@ -8918,6 +9042,9 @@ struct Model::Impl {
         CK(cudaStreamSynchronize(d.st));
         st.head_ms += now_ms() - th;
         prof_collect();
+        // Drafting also visits forward_layer. Do not let its marks leak into the
+        // next profiled single-token window (across an intervening verify call).
+        prof_window = false;
         pos += T;
         st.tokens += T;
         cache_tick(T);

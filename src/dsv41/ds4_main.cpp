@@ -929,6 +929,12 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
                      s.experts ? 100.0 * (double) s.cpu_experts / (double) s.experts : 0.0);
         if (d_off > 0) std::fprintf(stderr, "maya ds4 serve: drafts %lld of %lld kept; %s\n", d_acc, d_off,
                                     per_position(s_dec, s).c_str());
+        if (std::getenv("DS4_TIMINGS") || std::getenv("DS4_PROF")) {
+            std::fprintf(stderr, "ds4 request timing: draft %.2f ms, verify-forward %.2f ms, CPU-lane %.2f ms, "
+                                 "host-layer-submit %.2f ms, head-sync %.2f ms, Engram %.2f ms (overlap allowed)\n",
+                         s.draft_ms - s_dec.draft_ms, s.verify_ms - s_dec.verify_ms, s.cpu_ms - s_dec.cpu_ms,
+                         s.layer_ms - s_dec.layer_ms, s.head_ms - s_dec.head_ms, s.engram_ms - s_dec.engram_ms);
+        }
         m.save_profile();
     }
     // the engine ends (QUIT or the end of its input): the conversation in the model is set aside, and every one in

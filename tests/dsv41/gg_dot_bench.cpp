@@ -49,7 +49,7 @@ static void fill_blocks(uint8_t* w, size_t bytes, int type, uint64_t seed) {
     }
 }
 
-static int run_expert(int tg, int td, int threads, long mb, int nt, int reps) {
+static int run_expert(int tg, int td, int threads, long mb, int nt, int reps, int row_block) {
     ggml_cpu_init();
     const int E = 5120, FF = 2304;
     IqCpu f;
@@ -73,7 +73,6 @@ static int run_expert(int tg, int td, int threads, long mb, int nt, int reps) {
     }
     std::vector<float> h((size_t) ne * nt * FF), y((size_t) ne * nt * E);
     std::vector<uint8_t> hq((size_t) ne * nt * f.h_bytes);
-    const int RB = 64;
     auto run_jobs = [&](long njobs, const std::function<void(long)>& fn) {
         std::atomic<long> cur{0};
         std::vector<std::thread> th;
@@ -81,7 +80,7 @@ static int run_expert(int tg, int td, int threads, long mb, int nt, int reps) {
             th.emplace_back([&] { for (;;) { const long j = cur.fetch_add(1); if (j >= njobs) break; fn(j); } });
         for (auto& t : th) t.join();
     };
-    auto pass = [&](int mode) {
+    auto pass = [&](int mode, int RB) {
         gg_cpu_set_iq256(mode);
         double best = 1e30;
         for (int r = 0; r < reps + 1; ++r) {
@@ -111,7 +110,7 @@ static int run_expert(int tg, int td, int threads, long mb, int nt, int reps) {
     double t0s = 0;
     int rc = 0;
     for (int mode : {0, 2, 1}) {
-        const double t = pass(mode);
+        const double t = pass(mode, mode == 0 ? 64 : row_block);
         if (mode == 0) { y0 = y; t0s = t; }
         const bool same = std::memcmp(y0.data(), y.data(), y.size() * 4) == 0;
         std::printf("expert gate/up %d down %d nt %d threads %d: %d experts, %.2f GB | mode %s %.3f s = %.1f GB/s (x%.2f) %s\n", tg, td, nt,
@@ -125,7 +124,7 @@ int main(int argc, char** argv) {
     int type = 18, threads = 32, nt = 1, reps = 3;
     long mb = 3072;
     bool exact = false, expert = false, k512 = false;
-    int dtype = -1;
+    int dtype = -1, row_block = 64;
     std::string dump;   // --dump FILE: ggml-cpu's results (nt x rows floats) written raw - compare two builds with cmp
     for (int i = 1; i < argc; ++i) {
         std::string a = argv[i];
@@ -139,9 +138,10 @@ int main(int argc, char** argv) {
         else if (a == "--expert") expert = true;
         else if (a == "--k512") k512 = true;
         else if (a == "--dtype") dtype = (int) val();
+        else if (a == "--row-block") row_block = std::max(8, std::min(256, (int) val()));
         else if (a == "--dump" && i + 1 < argc) dump = argv[++i];
     }
-    if (expert) return run_expert(type, dtype < 0 ? type : dtype, threads, mb, nt, reps);
+    if (expert) return run_expert(type, dtype < 0 ? type : dtype, threads, mb, nt, reps, row_block);
     ggml_cpu_init();
     const int n = 5120;   // a gate / up row
     IqCpu f;

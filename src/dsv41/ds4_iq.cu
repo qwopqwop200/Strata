@@ -1161,9 +1161,27 @@ void launch_dn(const Args& a, int groups, cudaStream_t s) {
     else
         down_kernel<T, NE><<<dim3((unsigned) tiles, (unsigned) groups), kThreads, 0, s>>>(a, groups);
 }
+// Opt-in two-entry scheduling for common two-token verifier windows.
+// Each entry keeps the same dot-product order; the release dispatch stays NE=4.
+template <int T>
+bool pair_window_enabled() {
+#if defined(STRATA_USE_HIP)
+    return false;
+#else
+    if constexpr (T == kIQ2_XXS || T == kIQ2_XS || T == kIQ1_M) {
+        static const bool on = [] {
+            const char* v = std::getenv("DS4_IQ_PAIR_WINDOW");
+            return v && std::atoi(v) != 0;
+        }();
+        return on;
+    }
+    return false;
+#endif
+}
 template <int T>
 void gu_ne(const Args& a, int groups, int ne, cudaStream_t s) {
     if (ne <= 1) launch_gu<T, 1>(a, groups, s);
+    else if (ne == 2 && pair_window_enabled<T>()) launch_gu<T, 2>(a, groups, s);
     else if (ne <= 4) launch_gu<T, 4>(a, groups, s);
     else if (ne <= 8) launch_gu<T, 8>(a, groups, s);
     else launch_gu<T, 16>(a, groups, s);
@@ -1171,6 +1189,7 @@ void gu_ne(const Args& a, int groups, int ne, cudaStream_t s) {
 template <int T>
 void dn_ne(const Args& a, int groups, int ne, cudaStream_t s) {
     if (ne <= 1) launch_dn<T, 1>(a, groups, s);
+    else if (ne == 2 && pair_window_enabled<T>()) launch_dn<T, 2>(a, groups, s);
     else if (ne <= 4) launch_dn<T, 4>(a, groups, s);
     else if (ne <= 8) launch_dn<T, 8>(a, groups, s);
     else launch_dn<T, 16>(a, groups, s);

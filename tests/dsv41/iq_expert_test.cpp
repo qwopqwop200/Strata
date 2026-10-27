@@ -198,6 +198,21 @@ static void real_shape_bits(int type) {
     if (!iq::gate_up(a, NG, 3, 0) || !iq::down(a, NG, 3, 0)) { std::printf("real shape grouped: refused\n"); return; }
     CK(hipDeviceSynchronize());
     { auto h = down_(dh, (size_t) NEnt * FF); bits("real grp h", type, h.data(), h.size() * 4); auto p = down_(dp, (size_t) NEnt * E); bits("real grp part", type, p.data(), p.size() * 4); }
+    // Two-token verifier groups: scheduling specialization must preserve all bits.
+    {
+        a.grp_start = up(std::vector<int>{0, 2, 4});
+        a.grp_ent = up(std::vector<int>{0, 1, 8, 9});
+        CK(hipMemset(dh, 0, (size_t) NEnt * FF * 4));
+        CK(hipMemset(dp, 0, (size_t) NEnt * E * 4));
+        if (!iq::gate_up(a, NG, 2, 0) || !iq::down(a, NG, 2, 0)) {
+            std::printf("real shape two-token window: refused\n"); std::exit(2);
+        }
+        CK(hipDeviceSynchronize());
+        auto h = down_(dh, (size_t) NEnt * FF);
+        auto p = down_(dp, (size_t) NEnt * E);
+        bits("real pair h", type, h.data(), h.size() * 4);
+        bits("real pair part", type, p.data(), p.size() * 4);
+    }
     // more windows: a bound of 7 groups with 3 live (dynamic count), 5/1/3 entries (ne_max 5: the 8-entry kernels), then 9 groups of
     // one entry with 4 live; entries index the h/hq rows, their input row is entry >> 3
     {
