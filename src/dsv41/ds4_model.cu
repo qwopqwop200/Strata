@@ -2789,7 +2789,6 @@ struct Model::Impl {
                 cudaSetDevice(d.id);
                 size_t fr = 0, tot = 0;
                 CK(cudaMemGetInfo(&fr, &tot));
-                fr = uma_free(devs[(size_t) m].id, fr);
                 fr = uma_free(d.id, fr);
                 room += std::max(0.0, (double) fr - (double) ((size_t) o.reserve_mib << 20)) * o.vram_experts;
             }
@@ -4143,6 +4142,7 @@ struct Model::Impl {
                 cudaSetDevice(devs[(size_t) m].id);
                 size_t fr = 0, tot = 0;
                 CK(cudaMemGetInfo(&fr, &tot));
+                fr = uma_free(devs[(size_t) m].id, fr);
                 // (an integrated GPU, Windows: its memory is the system's.  What it allocates after the experts - the long
                 // prompt's buffers, the GEMM workspaces - spills into RAM when the experts took every byte of the GPU's
                 // address space, and on a 32K prompt that ran the machine out of RAM.  So the experts leave room for them,
