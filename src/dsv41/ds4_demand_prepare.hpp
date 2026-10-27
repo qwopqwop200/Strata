@@ -1,4 +1,6 @@
 // One confirmed CPU demand batch in flight; no weights or result buffers are owned here.
+// The CPU lane serializes start/finish and keeps the owner and mapped bytes alive
+// through the ticket's scope. The callback runs without mu_, never on the CPU lane.
 #pragma once
 #include <atomic>
 #include <chrono>
