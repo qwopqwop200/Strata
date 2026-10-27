@@ -2708,3 +2708,12 @@ if(STRATA_BUILD_DSV41 AND NOT STRATA_ENABLE_CUDA AND NOT STRATA_ENABLE_HIP AND N
     target_compile_definitions(ds4_gg_bench PRIVATE STRATA_DSV41_TQ_CPU=1)
   endif()
 endif()
+
+# Confirmed CPU demand preparation: host-only lifetime and overlap checks.
+if(STRATA_BUILD_TESTS)
+  add_executable(ds4_demand_prepare_test tests/dsv41/demand_prepare_test.cpp)
+  target_include_directories(ds4_demand_prepare_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src/dsv41)
+  target_link_libraries(ds4_demand_prepare_test PRIVATE Threads::Threads)
+  add_test(NAME ds4_demand_prepare COMMAND ds4_demand_prepare_test)
+  set_tests_properties(ds4_demand_prepare PROPERTIES TIMEOUT 15)
+endif()

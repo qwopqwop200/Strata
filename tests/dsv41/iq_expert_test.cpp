@@ -6,6 +6,8 @@
 //   iq_expert_test [--type 16,17,18,21,22,23,29] [--bench] [--iq256 0|1]
 #include "../../src/dsv41/ds4_gguf_cpu.hpp"
 #include "../../src/dsv41/ds4_iq.cuh"
+#include "../../src/dsv41/ds4_demand_prepare.hpp"
+#include "../../src/dsv41/ds4_os.hpp"
 
 #include "strata/dsv41/hip_or_cuda.h"   // HIP names on a HIP build, the CUDA runtime otherwise
 
@@ -591,7 +593,10 @@ int main(int argc, char** argv) {
                 // (the CPU lane rounds the activation to its own type - Q8_K, one F32 scale per 256 values - so the
                 //  reference is that quantized activation, not the device's per-32 one)
                 const std::vector<float> xhat = act_values(fm.gu_act, act.data(), E);
-                double wg = 0, wd = 0;
+                double wg = 0, wd = 0, wp = 0;
+                strata::ds4::DemandPrepare prepare([](const auto& range) {
+                    strata::ds4::os::prefetch_chunked({range}, 128 << 10);
+                });
                 for (int e = 0; e < NEXP; ++e) {
                     std::vector<float> hc(FF), yc(E);
                     float* hp[1] = {hc.data()}; float* yp[1] = {yc.data()};
@@ -608,7 +613,26 @@ int main(int argc, char** argv) {
                     const void* hpp[1] = {hact.data()};
                     gg::iq_cpu_down(fm, &blobs[e * blob + off[2]], hpp, 1, yp, 0, E);
                     for (int r = 0; r < E; ++r) { double sa; const double ref = dotd(&D[e].w[(size_t) r * FF], hhat.data(), FF, &sa); wd = std::max(wd, std::fabs(yc[r] - ref) / (sa + 1e-30)); }
+                    // Same CPU rows while confirmed preparation runs; exact output and scoped ownership.
+                    std::vector<uint8_t> hactcpu(fm.h_bytes);
+                    gg::iq_cpu_quant(fm.d_act, hc.data(), FF, hactcpu.data());
+                    std::vector<float> ycpu(E);
+                    const void* hpactcpu[1] = {hactcpu.data()};
+                    float* ypcpu[1] = {ycpu.data()};
+                    gg::iq_cpu_down(fm, &blobs[e * blob + off[2]], hpactcpu, 1, ypcpu, 0, E);
+                    std::vector<float> hpipe(FF), ypipe(E);
+                    float* hppipe[1] = {hpipe.data()}; float* yppipe[1] = {ypipe.data()};
+                    auto ticket = prepare.start({{&blobs[e * blob], blob}});
+                    gg::iq_cpu_gate_up(fm, &blobs[e * blob + off[0]], &blobs[e * blob + off[1]], ap, 1, hppipe, 0, FF, lim);
+                    std::vector<uint8_t> hactpipe(fm.h_bytes);
+                    gg::iq_cpu_quant(fm.d_act, hpipe.data(), FF, hactpipe.data());
+                    const void* hpactpipe[1] = {hactpipe.data()};
+                    gg::iq_cpu_down(fm, &blobs[e * blob + off[2]], hpactpipe, 1, yppipe, 0, E);
+                    ticket.finish();
+                    if (std::memcmp(hc.data(), hpipe.data(), FF * sizeof(float)) ||
+                        std::memcmp(ycpu.data(), ypipe.data(), E * sizeof(float))) wp = 1;
                 }
+                report("cpu demand identical", type, wp, 0);
                 report("cpu gate_up vs ref", type, wg, 1e-5);
                 report("cpu down vs ref", type, wd, 1e-5);
                 std::printf("%-7s cpu rows: %s\n", iq::name(type), gg::iq_cpu_own_rows(type) ? "Strata AVX2" : "ggml-cpu");

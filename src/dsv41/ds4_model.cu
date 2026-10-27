@@ -26,6 +26,7 @@
 #include "ds4_heat.hpp"
 #include "ds4_cache_scan.hpp"
 #include "ds4_store.hpp"
+#include "ds4_demand_prepare.hpp"
 #include "ds4_vision.cuh"
 #include "strata/dsv41/exl3_cpu.hpp"
 #include "strata/dsv41/exl3.hpp"
@@ -55,6 +56,7 @@
 #include <map>
 #include <mutex>
 #include <numeric>
+#include <optional>
 #include <sstream>
 #include <thread>
 #include <unordered_map>
@@ -1302,6 +1304,7 @@ struct Model::Impl {
         std::fflush(dump_l);
     }
 
+    std::unique_ptr<DemandPrepare> demand_prepare; // opt-in; drained within every CPU call
     ~Impl() {
         quit.store(true);
         if (warm_bg.joinable()) warm_bg.join();   // (the warm-up uses the BLAS handles destroyed below)
@@ -1314,6 +1317,13 @@ struct Model::Impl {
             }
         quit.store(true);
         if (service.joinable()) service.join();
+        if (demand_prepare) {
+            const auto ds = demand_prepare->stats();
+            std::fprintf(stderr, "ds4 demand pipeline: batches %llu ranges %llu cancelled %llu prepare_ms %.3f tail_ms %.3f (overlapping wall times)\n",
+                         (unsigned long long)ds.batches, (unsigned long long)ds.ranges,
+                         (unsigned long long)ds.cancelled, ds.prepare_ns / 1e6, ds.tail_ns / 1e6);
+            demand_prepare.reset();
+        }
         if (store_bg.joinable()) store_bg.join();   // (the store's background fill: it checks quit between its pieces)
         {
             std::lock_guard<std::mutex> lk(pf_mu);
@@ -6110,22 +6120,41 @@ struct Model::Impl {
         }
         const float lim = g.lim;
         const double tp0 = now_ms();
-        {   // (os::prefetch_cold, as above: the resident ones are left alone - on Windows the hint walks every page of a
-            // range, ~0.13 ms an IQ2_XXS expert, on the lane's critical path before the first entry computes.
-            // off by default (the mmap path, owner PC: not faster in every pair); DS4_IQ_PF_COLD=1 turns it on)
-            std::vector<std::pair<const void*, size_t>> want;
-            for (const Ent& en : ents)
-                if (!store && (l.ram.empty() || l.ram[(size_t) en.e] < 0))
-                    for (int r = 0; r < 3; ++r) want.push_back({mx_mat(l, en.e, r), mx_part_bytes(l, r)});
-            static const bool pf_all = std::getenv("DS4_IQ_PF_COLD") == nullptr || std::atoi(std::getenv("DS4_IQ_PF_COLD")) == 0;
-            static const size_t demand_chunk = [] {
-                const char* v = std::getenv("DS4_IQ_PREFETCH_KB");
-                return v ? (size_t)std::max(0, std::min(4096, std::atoi(v))) * 1024 : 0;
-            }();
-            if (demand_chunk) os::prefetch_chunked(want, demand_chunk);
-            else if (pf_all) os::prefetch(want);
-            else os::prefetch_cold(want);
+        // Existing predicted lookahead stays unchanged. This worker handles only this call's
+        // confirmed mmap demand, concurrently with activation prep and CPU rows. No new cache.
+        std::vector<DemandPrepare::Range> want;
+        for (const Ent& en : ents)
+            if (!store && (l.ram.empty() || l.ram[(size_t) en.e] < 0))
+                for (int r = 0; r < 3; ++r) want.push_back({mx_mat(l, en.e, r), mx_part_bytes(l, r)});
+        static const bool pf_all = std::getenv("DS4_IQ_PF_COLD") == nullptr || std::atoi(std::getenv("DS4_IQ_PF_COLD")) == 0;
+        static const size_t demand_chunk = [] {
+            const char* v = std::getenv("DS4_IQ_PREFETCH_KB");
+            return v ? (size_t)std::max(0, std::min(4096, std::atoi(v))) * 1024 : 0;
+        }();
+        static const bool pipeline = [] {
+            const char* v = std::getenv("DS4_CPU_DEMAND_PIPELINE");
+            return v && std::atoi(v) != 0;
+        }();
+        auto prepare = [](const std::vector<DemandPrepare::Range>& ranges) {
+            if (demand_chunk) os::prefetch_chunked(ranges, demand_chunk);
+            else if (pf_all) os::prefetch(ranges);
+            else os::prefetch_cold(ranges);
+        };
+        if (pipeline && !want.empty() && !demand_prepare) {
+            try {
+                demand_prepare.reset(new DemandPrepare([prepare, one = std::vector<DemandPrepare::Range>(1)](const DemandPrepare::Range& r) mutable {
+                    one[0] = r;
+                    prepare(one);
+                }));
+                std::fprintf(stderr, "ds4: confirmed CPU demand pipeline enabled (one preparation worker)\n");
+            } catch (const std::system_error&) {
+                // A system without an available worker keeps the synchronous path.
+            }
         }
+        std::optional<DemandPrepare::Ticket> demand_ticket;
+        if (pipeline && !want.empty() && demand_prepare)
+            demand_ticket.emplace(demand_prepare->start(std::move(want)));
+        else prepare(want);
         // the activations in c_xh's bytes, E 4 apart: token t's (t < kWin) at row t - quantized once, whatever number of
         // entries take it - then a row a slot (kWin + slot): a token past the window's input (none on the decode or
         // chunk paths), then (x no longer needed) the slot's h
@@ -6181,6 +6210,7 @@ struct Model::Impl {
                 gg::iq_cpu_down(fm, mx_part_ptr(l, en.e, 2, X), hp, en.n, yp, r0 - X * Eh, r1 - X * Eh);
             };
         run_nodes(ne * DB, f);
+        if (demand_ticket) demand_ticket->finish(); // drain before mapping ownership can change
         {   // DS4_PROF: where the CPU lane's time goes (act prep + prefetch, gate/up, h quant, down), summed
             static const bool on = std::getenv("DS4_PROF") != nullptr;
             if (on) {
