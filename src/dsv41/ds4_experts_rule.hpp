@@ -209,8 +209,13 @@ inline bool dq_old_default(int env, bool gfx11, bool v026 = false) {
 
 // The head's columns a pass for a GGUF head (DS4_HEAD_PER overrides): 0.2.6 4, 0.2.7 8 (the same logits per column).
 inline int head_per_default(bool v026 = false) { return v026 ? 4 : 8; }
-// The drafter's markov head quantised to Q8_0 as it loads (0.2.7) or read as F16 (0.2.6).
+// The drafter's whole markov head quantised to Q8_0 as it loads (0.2.7) or read as F16 (0.2.6).
 inline bool markov_head_q8_default(bool v026 = false) { return !v026; }
+// DS4_MARKOV_HEAD_Q8: -1 unset uses the release default; explicit 0 / 1 overrides either release.
+// This selects the whole head. Multi-device greedy mk_split still uses its existing F16 shares.
+inline bool markov_head_q8_value(int env, bool v026 = false) {
+    return env >= 0 ? env != 0 : markov_head_q8_default(v026);
+}
 // The gate/up tiles read the layer's F16 copy of the activations (0.2.7, bit-identical) or the F32 rows (0.2.6).
 inline bool gate_up_x16_default(bool v026 = false) { return !v026; }
 // STRATA_DENSE_PFGEMM (the RDNA3 WMMA dense GEMM before hipBLAS; -1 unset, else 0 / 1): 0.2.6 did not have it.

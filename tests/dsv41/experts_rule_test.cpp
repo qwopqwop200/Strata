@@ -300,6 +300,17 @@ int main() {
         CHECK_EQ(head_per_default(false), 8);
         CHECK_EQ(markov_head_q8_default(true), 0);
         CHECK_EQ(markov_head_q8_default(false), 1);
+        // Per-feature override preserves the latest default and does not roll back any unrelated rule.
+        for (bool v026 : {false, true}) {
+            CHECK_EQ(markov_head_q8_value(-1, v026), !v026);
+            CHECK_EQ(markov_head_q8_value(0, v026), 0);
+            CHECK_EQ(markov_head_q8_value(1, v026), 1);
+            CHECK_EQ(head_per_default(v026), v026 ? 4 : 8);
+            CHECK_EQ(gate_up_x16_default(v026), !v026);
+        }
+        CHECK_EQ(markov_head_q8_value(-1), 1);
+        CHECK_EQ(markov_head_q8_value(0), 0);
+        CHECK_EQ(markov_head_q8_value(1), 1);
         CHECK_EQ(gate_up_x16_default(true), 0);
         CHECK_EQ(gate_up_x16_default(false), 1);
         CHECK_EQ(dense_pfgemm_default(-1, true), 0);

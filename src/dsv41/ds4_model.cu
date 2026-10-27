@@ -2564,6 +2564,16 @@ struct Model::Impl {
             devs[(size_t) head_dev].mk_ints = d_ints;   // (the lead's drafted tokens: where the confidence head reads them)
             mk_split = true;
         }
+        if (o.verbose && g.n_mtp > 0) {
+            const int override_q8 = env_tri("DS4_MARKOV_HEAD_Q8");
+            const bool v026 = defaults_026();
+            const char* whole = d_mk_head_q8 != nullptr ? "Q8_0" : "F16";
+            std::fprintf(stderr,
+                         "ds4: draft markov-head whole=%s greedy=%s sampled=%s source=%s DS4_MARKOV_HEAD_Q8=%s defaults=%s\n",
+                         whole, mk_split ? "F16-split" : whole, whole,
+                         override_q8 < 0 ? "release-default" : "explicit-override",
+                         override_q8 < 0 ? "unset" : override_q8 ? "1" : "0", v026 ? "026" : "027");
+        }
 
         // the embedding table, pinned on the host
         {
@@ -4007,7 +4017,7 @@ struct Model::Impl {
                     return false;
                 }
                 if (!dalloc(d, d_mk_embed, te->bytes / 2, err, acct) || !upload(d, *te, d_mk_embed, err) ||
-                    ((env_tri("DS4_MARKOV_HEAD_Q8") < 0 ? strata::ds4::markov_head_q8_default(defaults_026()) : env_tri("DS4_MARKOV_HEAD_Q8") != 0)
+                    (strata::ds4::markov_head_q8_value(env_tri("DS4_MARKOV_HEAD_Q8"), defaults_026())
                          ? !mk_head_q8(d, Z + "markov_head.head.weight", d_mk_head_q8, err, acct)
                          : !f16raw(d, Z + "markov_head.head.weight", d_mk_head, err, acct)))   // (0.2.6: the head as F16)
                     return false;
