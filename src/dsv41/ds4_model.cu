@@ -1305,6 +1305,7 @@ struct Model::Impl {
     }
 
     std::unique_ptr<DemandPrepare> demand_prepare; // opt-in; drained within every CPU call
+    bool demand_reported = false; // first completed batch, also visible before model shutdown
     ~Impl() {
         quit.store(true);
         if (warm_bg.joinable()) warm_bg.join();   // (the warm-up uses the BLAS handles destroyed below)
@@ -6210,7 +6211,17 @@ struct Model::Impl {
                 gg::iq_cpu_down(fm, mx_part_ptr(l, en.e, 2, X), hp, en.n, yp, r0 - X * Eh, r1 - X * Eh);
             };
         run_nodes(ne * DB, f);
-        if (demand_ticket) demand_ticket->finish(); // drain before mapping ownership can change
+        if (demand_ticket) {
+            demand_ticket->finish(); // drain before mapping ownership can change
+            if (!demand_reported) {
+                const auto ds = demand_prepare->stats();
+                std::fprintf(stderr, "ds4 demand pipeline completed: layer=%d entries=%d rb=%d shards=%d gate_jobs_per_shard=%d down_jobs_per_shard=%d batches=%llu ranges=%llu cancelled=%llu prepare_ms=%.3f tail_ms=%.3f (overlapping wall times)\n",
+                             l.il, ne, RB, NH, ne * GB, ne * DB,
+                             (unsigned long long)ds.batches, (unsigned long long)ds.ranges,
+                             (unsigned long long)ds.cancelled, ds.prepare_ns / 1e6, ds.tail_ns / 1e6);
+                demand_reported = true;
+            }
+        }
         {   // DS4_PROF: where the CPU lane's time goes (act prep + prefetch, gate/up, h quant, down), summed
             static const bool on = std::getenv("DS4_PROF") != nullptr;
             if (on) {
