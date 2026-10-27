@@ -1891,12 +1891,12 @@ if(STRATA_NATIVE_EXPERTS)
   endif()
   # part of strata_kernels_cpu (the pool calls these and they call its CPU probe: one library, so GNU ld's
   # one-pass static linking has no cycle to resolve)
-  target_sources(strata_kernels_cpu PRIVATE src/kernels/cpu/native_expert.cpp)
+  target_sources(strata_kernels_cpu PRIVATE src/kernels/cpu/native_expert.cpp src/kernels/cpu/tq_cpu.cpp)
   if(STRATA_CPU_X86)
     target_sources(strata_kernels_cpu PRIVATE src/kernels/cpu/iq_avx512.cpp src/kernels/cpu/iq_avx2.cpp
                                              src/kernels/cpu/kq_avx2.cpp src/kernels/cpu/kq_avx1.cpp src/kernels/cpu/q2_avx1.cpp
                                              src/kernels/cpu/iq_avx1.cpp src/kernels/cpu/nvfp4_avx512.cpp src/kernels/cpu/nvfp4_avx2.cpp
-                                             src/kernels/cpu/tq_cpu.cpp src/kernels/cpu/tq_avx2.cpp src/kernels/cpu/tq_avx512.cpp)
+                                             src/kernels/cpu/tq_avx2.cpp src/kernels/cpu/tq_avx512.cpp)
   endif()
   target_include_directories(strata_kernels_cpu PRIVATE third_party/ggml)
   if(MSVC)

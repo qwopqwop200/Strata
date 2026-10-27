@@ -122,6 +122,10 @@ bool iq512x_supported(int) noexcept { return false; }
 void iq512x_rows(int, const uint8_t*, size_t, int, const void* const*, int, float* const*, int, int) {
     unsupported("the AVX-512 exact i-quant kernel");
 }
+bool iq256x_supported(int) noexcept { return false; }
+void iq256x_rows(int, const uint8_t*, size_t, int, const void* const*, int, float* const*, int, int) {
+    unsupported("the AVX-2 exact i-quant kernel");
+}
 int iq256_variant() noexcept { return 0; }
 int iq256_variants() noexcept { return 0; }
 void iq256_gu_rows_v(int, int, const uint8_t*, size_t, size_t, int, const void* const*, int, float* const*, int, int) {
@@ -141,6 +145,9 @@ void iq4nl256_down_rows_v(int, const uint8_t*, size_t, int, const void* const*, 
 }
 void iq4nl256_down_rows(const uint8_t*, size_t, int, const void* const*, int, float* const*, int, int) {
     unsupported("the AVX-2 IQ4_NL kernel");
+}
+void iq4nl_reference_rows(const uint8_t*, size_t, int, const void* const*, int, float* const*, int, int) {
+    unsupported("the AVX-2 IQ4_NL reference rows");
 }
 void q8k_quant_avx2(const float*, void*, int64_t) { unsupported("the AVX-2 Q8_K quantizer"); }
 void kq256_gu_rows(int, const uint8_t*, size_t, size_t, int, const void* const*, int, float* const*, int, int) {
@@ -203,6 +210,7 @@ void nvfp4_512_rows(const uint8_t* w, size_t row_bytes, int n, const void* const
 void q2_0_gguf_rows_multi_avx1_legacy(const uint8_t* w, size_t row_bytes, int nblocks, const ActQ* const* a, int nt, float* const* out, int r0, int r1) { cpu_kernel_unreachable("q2_0_gguf_rows_multi_avx1_legacy"); }
 void q2_0_gguf_rows_multi_avx1(const uint8_t* w, size_t row_bytes, int nblocks, const ActQ* const* a, int nt, float* const* out, int r0, int r1) { cpu_kernel_unreachable("q2_0_gguf_rows_multi_avx1"); }
 void q8k_quant_avx1(const float* x, void* y, int64_t n) { cpu_kernel_unreachable("q8k_quant_avx1"); }
+#if !defined(STRATA_NATIVE_EXPERTS)
 void tq_gu_rows(TqIsa isa, int ggml_type, const uint8_t* blob, size_t gu_row, size_t up_off, int n, const void* const* act, int nt, float* const* ff, int r0, int r1) { cpu_kernel_unreachable("tq_gu_rows"); }
 TqIsa tq_isa() { return TqIsa::scalar; }
 int tq_kbits(int ggml_type) noexcept { return 0; }
@@ -210,5 +218,20 @@ bool tq_kernels_enabled() { return false; }
 void tq_rows(TqIsa isa, int ggml_type, const uint8_t* w, size_t row_bytes, int n, const void* const* act, int nt, float* const* out, int r0, int r1) { cpu_kernel_unreachable("tq_rows"); }
 
 bool tq_supported(int) noexcept { return false; }
+#else
+// Native experts use tq_cpu.cpp's portable scalar rows. These symbols remain linked
+// by its dispatch, but cannot be selected because the CPU feature probes are false.
+namespace tq_detail {
+void tq_rows_avx2(int, const int16_t*, const uint8_t*, size_t, int, const TqAct* const*, int, float* const*, int, int) {
+    cpu_kernel_unreachable("tq_rows_avx2");
+}
+void tq_rows_avx512(int, const int16_t*, const uint8_t*, size_t, int, const TqAct* const*, int, float* const*, int, int) {
+    cpu_kernel_unreachable("tq_rows_avx512");
+}
+void tq_rows_avx2_tqp(int, const uint8_t*, size_t, int, const TqAct* const*, int, float* const*, int, int) {
+    cpu_kernel_unreachable("tq_rows_avx2_tqp");
+}
+} // namespace tq_detail
+#endif
 
 }  // namespace strata::kernels::cpu

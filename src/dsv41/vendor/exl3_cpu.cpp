@@ -140,6 +140,9 @@ void band_scalar(const Exl3Part& m, const float* xh, int tc0, int ks0, int ks1, 
         }
 }
 
+// Shared scratch sizing also uses this on non-x86 CPUs.
+constexpr int kGemmK = 256;
+
 // ---------------------------------------------------------------- AVX-512
 #if defined(EXL3_X86)
 template <int K>
@@ -320,7 +323,6 @@ EXL3_AVX512 void rows_avx512_n(const Exl3Part& m, const float* const* xh, int ks
 // (wc, in L2), then multiplied as a GEMM: tiles of TB activations x 64 columns, the sums in registers, two FMAs a
 // load.  The prompt path's CPU rows, where an expert serves tens to hundreds of tokens: one decode (~6 instructions a
 // 16-weight row) for all of them instead of one per kExl3CpuMaxN.
-constexpr int kGemmK = 256;
 
 template <int K>
 EXL3_AVX512 void decode_chunk(const Exl3Part& m, int tc0, int ks0, int ks1, float* wc /* (ks1 - ks0) 16 x 128 */) {
