@@ -107,6 +107,7 @@ function saveApiKey(notify = false) {
 $("api-key").oninput = () => saveApiKey();
 $("api-key").onchange = () => saveApiKey(true);
 
+let healthDefaultsLoaded = false;
 let health = {model: "strata", images: false, max_context: 0};
 // the texts that depend on what this server offers: the empty chat's line and the attach button's hint
 function renderEmptyChat() {
@@ -117,6 +118,8 @@ function renderEmptyChat() {
 async function loadHealth() {
   try {
     health = await (await fetch("health")).json();
+    applyThinkingDefault(health.reasoning_effort_default);
+    healthDefaultsLoaded = true;
     renderEmptyChat();
     $("tab-btn-images").hidden = !health.image_generation;
     if (location.hash === "#images" && health.image_generation) showTab("images");
@@ -793,7 +796,36 @@ function samplingUntouched(s) {
   const t = +s.temperature;
   return (t === DEFAULTS.temperature || t === OLD_DEFAULT_TEMPERATURE) && +s.top_p === DEFAULTS.top_p && +s.top_k === DEFAULTS.top_k;
 }
-let settings = {...DEFAULTS, ...store.get("sampling", {})};
+const savedSampling = store.get("sampling", {});
+let settings = {...DEFAULTS, ...savedSampling};
+function applyThinkingDefault(value) {
+  if (value == null || value === "") return; // keep the existing family default
+  const numeric = Number.isInteger(value) && value >= 1 && value <= 100;
+  if (!numeric && !["none", "low", "medium", "high"].includes(value)) return;
+  DEFAULTS.thinking = String(value);
+  if (!Object.prototype.hasOwnProperty.call(savedSampling, "thinking") && !thinkingChosen)
+    settings.thinking = DEFAULTS.thinking;
+  if (numeric && ![...$("s-thinking").children].some(b => b.dataset.v === String(value))) {
+    const b = document.createElement("button");
+    b.type = "button"; b.setAttribute("role", "radio"); b.dataset.v = String(value);
+    b.textContent = String(value); $("s-thinking").appendChild(b);
+    b.onclick = () => selectThinking(b);
+  }
+}
+function thinkingRequestValue(value) {
+  return /^(?:[1-9][0-9]?|100)$/.test(String(value)) ? Number(value) : value;
+}
+function thinkingRequestFields() {
+  // Before health arrives, let the server apply its configured default instead of guessing high.
+  if (!healthDefaultsLoaded && !Object.prototype.hasOwnProperty.call(savedSampling, "thinking") && !thinkingChosen) return {};
+  return {reasoning_effort: thinkingRequestValue(settings.thinking)};
+}
+let thinkingChosen = false;
+function selectThinking(b) {
+  thinkingChosen = true;
+  for (const x of $("s-thinking").children) x.setAttribute("aria-checked", String(x === b));
+  outputs();
+}
 if (samplingUntouched(settings)) settings.temperature = DEFAULTS.temperature;
 let messages = store.get("chat", []);   // the open chat's messages (chats-ui.js: with the saved-chats list on, also that chat's own)
 let attachments = [];                 // {name, url}
@@ -1212,8 +1244,7 @@ async function generateReply() {
   setBusy(true);
   paintLive();
 
-  const body = {model: health.model, messages: apiMessages(), stream: true,
-                reasoning_effort: settings.thinking};
+  const body = {model: health.model, messages: apiMessages(), stream: true, ...thinkingRequestFields()};
   if (!(settings.temperature > 0)) {
     body.temperature = 0;
   } else if (!samplingUntouched(settings)) {
@@ -1459,7 +1490,7 @@ async function loadShared() {
   $("s-share").setAttribute("aria-checked", String(sharedOn));
 }
 function sharedDefaults(s) {
-  const d = {reasoning_effort: s.thinking};
+  const d = {reasoning_effort: thinkingRequestValue(s.thinking)};
   if (!(+s.temperature > 0)) d.temperature = 0;
   else if (!samplingUntouched(s)) Object.assign(d, {temperature: +s.temperature, top_p: +s.top_p, top_k: +s.top_k});
   if (s.seed) d.seed = +s.seed;
@@ -1489,14 +1520,14 @@ function outputs() {
   $("o-topk").textContent = $("s-topk").value;
   const sel = segValue("s-thinking");
   $("o-thinking").textContent = sel ? {none: tr("drawer.thinkNone", "answers right away"), low: tr("drawer.thinkLow", "short"),
-    medium: tr("drawer.thinkMedium", "medium"), high: tr("drawer.thinkHigh", "thorough (default)")}[sel] : "";
+    medium: tr("drawer.thinkMedium", "medium"), high: tr("drawer.thinkHigh", "thorough (default)")}[sel] || sel : "";
   const busyMode = segValue("s-busy");
   $("o-busy").textContent = {wait: tr("drawer.busyWaitNote", "Send is off until the answer is done, as before."),
     queue: tr("drawer.busyQueueNote", "Your message waits and goes as soon as the answer is done."),
     interject: tr("drawer.busyInterjectNote", "The answer stops where it is (what is written stays) and your message goes at once. A tool that is running finishes first.")}[busyMode] || "";
   for (const id of ["s-topp", "s-topk"]) $(id).disabled = t === 0;
 }
-for (const b of $("s-thinking").children) b.onclick = () => { for (const x of $("s-thinking").children) x.setAttribute("aria-checked", String(x === b)); outputs(); };
+for (const b of $("s-thinking").children) b.onclick = () => selectThinking(b);
 for (const b of $("s-busy").children) b.onclick = () => { for (const x of $("s-busy").children) x.setAttribute("aria-checked", String(x === b)); outputs(); };
 for (const id of ["s-temp", "s-topp", "s-topk"]) $(id).oninput = outputs;
 for (const id of ["s-math", "s-show", "s-esp", "s-mcp", "s-share", "s-list", "s-edit"]) {
@@ -1507,7 +1538,7 @@ $("s-apply").onclick = async () => {
   const prev = settings;
   // the list and the edit controls change the messages on the screen: not while an answer is written or something is open
   const locked = !!busy || !!panel;
-  settings = {thinking: segValue("s-thinking") || "high", temperature: +$("s-temp").value, top_p: +$("s-topp").value,
+  settings = {thinking: segValue("s-thinking") || settings.thinking, temperature: +$("s-temp").value, top_p: +$("s-topp").value,
               top_k: +$("s-topk").value, max: $("s-max").value.trim(), seed: $("s-seed").value.trim(),
               math: checked("s-math"), show: checked("s-show"), esp: checked("s-esp"), mcp: checked("s-mcp"),
               chatList: locked ? !!prev.chatList : checked("s-list"), chatEdit: locked ? !!prev.chatEdit : checked("s-edit"),
