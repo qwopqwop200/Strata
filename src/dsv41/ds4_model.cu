@@ -30,6 +30,7 @@
 #include "ds4_store.hpp"
 #include "ds4_demand_prepare.hpp"
 #include "ds4_vision.cuh"
+#include "ds4_vision_contract.hpp"
 #include "strata/dsv41/exl3_cpu.hpp"
 #include "strata/dsv41/exl3.hpp"
 #include "strata/kernels/f16_bits.hpp"
@@ -2303,15 +2304,37 @@ struct Model::Impl {
                          kWin, o.prefill_chunk == 0 ? "--prefill-chunk 0" : "--tp 1 with --threads off", kVlRows,
                          o.prefill_chunk == 0 ? "leave --prefill-chunk out for chunks"
                                               : "leave --tp 1 out, or pass --threads on, for chunks");
+        // Atomic multimodal validation is explicit: never call a text-only fallback vision success.
+        vision_required = vision_contract::required(std::getenv("DS4_REQUIRE_VISION"));
+        if (vision_required && !o.vision) {
+            err = "DS4_REQUIRE_VISION=1 conflicts with --vision off";
+            return false;
+        }
+        if (vision_required && !o.vision_only) {
+            for (int il = 0; il < g.nl; ++il) {
+                const std::string name = "layers." + std::to_string(il) + ".ffn.gate.bias_vl";
+                const Tensor* t = pk.get(name);
+                if (!vision_contract::bias_layout(t != nullptr, t != nullptr && t->dtype == "F32",
+                                                   t != nullptr ? t->bytes : 0, t != nullptr ? t->shape.size() : 0,
+                                                   t != nullptr && !t->shape.empty() ? t->shape[0] : 0, g.n_exp)) {
+                    err = name + ": required original image routing bias is missing or not F32 [n_experts]";
+                    return false;
+                }
+            }
+        }
         // the vision tower on the first GPU, before the split: the layers get what it leaves
         if (o.vision && !load_vision(err)) {   // (a tower that cannot load leaves the model reading text: said loudly,
-            if (o.vision_only) return false;   // and the server is told pictures are off - info_lines)
+            if (o.vision_only || vision_required) return false;   // strict image operation never degrades to text
             std::fprintf(stderr, "ds4: WARNING: the vision tower did not load (%s): pictures are OFF, the model reads "
                                  "text only\n", err.c_str());
             vision_err = err.empty() ? "unknown reason" : err;
             err.clear();
             vt.release();
             img_tok = -1;
+        }
+        if (vision_required && (img_tok < 0 || img_tok >= g.vocab)) {
+            err = "DS4_REQUIRE_VISION=1: the pack has no usable original vision tower/image token";
+            return false;
         }
         if (o.vision_only) return true;
 
@@ -6103,6 +6126,8 @@ struct Model::Impl {
     VisionTower vt;
     VisionGeo vg;
     int img_tok = -1;
+    bool vision_required = false;
+    uint64_t vision_encode_reported = 0;
     std::string vision_err;              // why the tower did not load (pictures off), or empty
     std::vector<uint16_t> img_mark[3];   // image_start, image_newline, image_end: BF16 [dim]
     std::vector<Image> imgs;             // the pictures of the prompt being fed, by start
@@ -6128,6 +6153,11 @@ struct Model::Impl {
         vg.inter = (int) pk.num("vision.intermediate_size", 2816), vg.patch = (int) pk.num("vision.patch_size", 14);
         vg.merge = (int) pk.num("vision.downsample_ratio", 3), vg.theta = (float) pk.num("vision.rope_theta", 1e4);
         vg.max_tokens = (int) pk.num("vision.max_image_tokens", 1024), vg.out = g.dim;
+        if (vision_required && (vg.dim <= 0 || vg.heads <= 0 || vg.dim % vg.heads != 0 || vg.inter <= 0 ||
+                                vg.patch <= 0 || vg.merge <= 0 || vg.max_tokens < 4 || tok >= g.vocab)) {
+            err = "required vision geometry/image token is invalid";
+            return false;
+        }
         const char* mark[3] = {"image_start", "image_newline", "image_end"};
         for (int i = 0; i < 3; ++i) {
             const Tensor* t = pk.get(mark[i]);
@@ -6190,6 +6220,12 @@ struct Model::Impl {
             put(img_mark[1].data());
         }
         put(img_mark[2].data());
+        if (vision_required && vision_encode_reported < 16) {
+            ++vision_encode_reported;
+            std::fprintf(stderr, "ds4 vision encode: completed=1 call=%llu width=%d height=%d span_rows=%zu "
+                                 "output_dim=%d scope=model_lifetime sample_limit=16\n",
+                         (unsigned long long) vision_encode_reported, w, h, span.size() / D, g.dim);
+        }
         return true;
     }
     // the row of a picture's span at position p (null: p is in none)
@@ -10695,6 +10731,11 @@ struct Model::Impl {
                           (long long) pk.num("vision.max_wh_ratio", 0), img_tok, vt.device(),
                           (long long) (vt.device_bytes() >> 20));
             v.push_back(b);
+            if (vision_required) {
+                std::snprintf(b, sizeof b, "INFO vision_required=1 original_bias_metadata_layers=%d "
+                                          "encode_execution_certified=0", g.nl);
+                v.push_back(b);
+            }
         } else if (!vision_err.empty()) {   // (the server offers no pictures and says why)
             std::string why = vision_err;
             for (char& ch : why)

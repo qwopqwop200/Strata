@@ -63,6 +63,8 @@ def fit_size(width: int, height: int, max_tokens: int = MAX_TOKENS, min_pixels: 
              patch: int = PATCH, merge: int = MERGE) -> tuple[int, int]:
     """The size to resize a width x height picture to: its own shape, both sides a multiple of patch * merge, scaled down until its
     span is within `max_tokens` and up until it has `min_pixels` (when that fits the budget).  Never smaller than one cell."""
+    if patch <= 0 or merge <= 0 or max_tokens < 4 or min_pixels < 0:
+        raise ValueError("invalid DeepSeek vision geometry/token budget")
     cell = patch * merge
     if width <= 0 or height <= 0:
         raise ValueError("the picture has no size")
@@ -95,26 +97,33 @@ class DsPictures:
         self.max_tokens = int(max_tokens)
         self.min_pixels = int(min_pixels)
         self.patch, self.merge = int(patch), int(merge)
+        if self.image_token < 0 or self.patch <= 0 or self.merge <= 0 or self.max_tokens < 4 or self.min_pixels < 0:
+            raise ValueError("invalid DeepSeek vision token/geometry metadata")
         self.dir = Path(tmp_dir) if tmp_dir else Path(tempfile.gettempdir())
 
     @classmethod
     def from_config(cls, cfg: dict, tmp_dir=None):
         """-> DsPictures, or None: pictures are off (`--vision off`), or the pack has no vision tower (no vision.* keys / image token)."""
         args = cfg.get("args") or []
-        if not vision_wanted(args):
+        required = cfg.get("require_vision") is True or (cfg.get("env") or {}).get("DS4_REQUIRE_VISION") == "1"
+        def unavailable(reason):
+            if required:
+                raise ValueError("required DeepSeek vision is unavailable: " + reason)
             return None
+        if not vision_wanted(args):
+            return unavailable("--vision off conflicts with require_vision")
         pack = args_after(args, "--pack")
         if not pack:
-            return None
+            return unavailable("no model pack")
         k = pack_keys(pack)
         try:
             if int(k.get("vision.num_hidden_layers", "0")) <= 0 or "image_token_id" not in k:
-                return None
+                raise ValueError("pack has no vision tower/image token metadata")
             return cls(int(k["image_token_id"]), int(k.get("vision.max_image_tokens", MAX_TOKENS)),
                        int(float(k.get("vision.min_pixels", MIN_PIXELS))), tmp_dir,
                        int(k.get("vision.patch_size", PATCH)), int(k.get("vision.downsample_ratio", MERGE)))
-        except ValueError:
-            return None
+        except (ValueError, OverflowError) as e:
+            return unavailable(str(e))
 
     # ---- the members the Service asks of any picture encoder
     def alive(self) -> bool:
