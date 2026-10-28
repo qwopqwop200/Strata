@@ -957,6 +957,10 @@ struct Model::Impl {
     int d_dev = 0;                    // the drafter's first block's device
     bool spec_win = false;            // the window being run is a draft's verification (layer() keeps backups)
     float* h_taps = nullptr;          // pinned [kWin][targets][dim]: the last window's taps
+    // Opt-in decode scratch; never aliases xe (the intervening trunk layers reuse xe).
+    float* d_decode_taps = nullptr;   // [kWin][3][5120], one serial CUDA stream only
+    bool device_taps_requested = std::getenv("DS4_DSPARK_DEVICE_TAPS") != nullptr &&
+                                 std::strcmp(std::getenv("DS4_DSPARK_DEVICE_TAPS"), "1") == 0;
     cudaEvent_t ev_seed = nullptr;    // the drafter's seeding read h_taps: the next window's taps wait for it
     float* d_confv = nullptr;         // on the head device
     int* d_ints = nullptr;            // on the head device: drafts in, picks out
@@ -2537,6 +2541,28 @@ struct Model::Impl {
             CK(cudaSetDevice(devs[(size_t) d_dev].id));
             CK(cudaEventCreateWithFlags(&ev_seed, cudaEventDisableTiming));
             CK(cudaEventRecord(ev_seed, devs[(size_t) d_dev].st));
+            // Bound the optional allocation to the current pack. Prefill and dumps keep their host taps.
+            if (device_taps_requested && !kHipBuild && devs.size() == 1 && !par && o.tp <= 1 &&
+                d_dev == 0 && head_dev == 0 && dump_d == nullptr && dump_h == nullptr &&
+                g.dim == 5120 && g.d_targets.size() == 3) {
+                Dev& d = devs[0];
+                void* v = nullptr;
+                const size_t bytes = (size_t) kWin * 3 * 5120 * sizeof(float);
+                const cudaError_t rc = cudaMalloc(&v, bytes);
+                if (rc == cudaSuccess) {
+                    d_decode_taps = (float*) v;
+                    d.allocs.push_back(v);
+                    d.scratch += bytes;
+                } else if (rc == cudaErrorMemoryAllocation) {
+                    (void) cudaGetLastError();   // optional scratch unavailable: use the host path
+                } else {
+                    CK(rc);
+                }
+            }
+            if (o.verbose && device_taps_requested)
+                std::fprintf(stderr, "ds4: device taps requested=1 active=%d bytes=%zu decode_only=1\n",
+                             d_decode_taps != nullptr ? 1 : 0,
+                             d_decode_taps != nullptr ? (size_t) kWin * 3 * 5120 * sizeof(float) : 0);
         }
         // the dense weights, each device's layers by a thread of its own
         {
@@ -7105,7 +7131,9 @@ struct Model::Impl {
     // and each block's wkv / kv_norm / rope / FP8, for the positions the trunk kept.  draft() runs the block [y, noise x
     // (block - 1)] at positions pos .. through the blocks (each query attending to the ring and to the whole block),
     // the trunk's head, the markov bias token by token (greedy) and the confidence head.
-    bool seed_drafter(int64_t p0, int n, int row0, std::string& err) {
+    // The device pointer is call-local, produced by this forward's taps before any seeding.
+    // Same-stream main_proj consumes it before the next decode can overwrite it.
+    bool seed_drafter(int64_t p0, int n, int row0, std::string& err, const float* device_taps = nullptr) {
         if (g.n_mtp == 0 || n <= 0) return true;
         if (n > kWin * kPicks) {
             err = "seeding the drafter with " + std::to_string(n) + " rows";
@@ -7127,9 +7155,14 @@ struct Model::Impl {
         }
         for (int a = 0; a < n; a += kWin) {   // (a chunk's last 128 rows: 16 a GEMV)
             const int na = std::min(kWin, n - a);
-            CK(cudaMemcpyAsync(d.xe, h_taps + (size_t) (row0 + a) * nt * D, (size_t) na * nt * D * 4,
-                               cudaMemcpyHostToDevice, d.st));
-            if (!mv(d, {job(d_main_proj, d.xe, d.ed + (size_t) a * D, na, (size_t) nt * D, D)}, err)) return false;
+            const float* taps = d.xe;
+            if (device_taps != nullptr) {
+                taps = device_taps + (size_t) (row0 + a) * nt * D;
+            } else {
+                CK(cudaMemcpyAsync(d.xe, h_taps + (size_t) (row0 + a) * nt * D, (size_t) na * nt * D * 4,
+                                   cudaMemcpyHostToDevice, d.st));
+            }
+            if (!mv(d, {job(d_main_proj, taps, d.ed + (size_t) a * D, na, (size_t) nt * D, D)}, err)) return false;
         }
         CK(cudaEventRecord(ev_seed, d.st));
         Finish fm;
@@ -7364,7 +7397,8 @@ struct Model::Impl {
         for (int i = 0; i < n; ++i) tk[i + 1] = drafts[(size_t) i];
         spec_win = true;
         const double tv = now_ms();
-        const bool ok = forward(tk, T, T, err, 0);
+        float* const taps = decode_taps(T);
+        const bool ok = forward(tk, T, T, err, 0, taps);
         st.verify_ms += now_ms() - tv;
         spec_win = false;
         if (!ok) return false;
@@ -7414,7 +7448,7 @@ struct Model::Impl {
         }
         drafts_q = false;
         rollback(p0, T, m + 1);
-        if (!seed_drafter(p0, m + 1, 0, err)) return false;
+        if (!seed_drafter(p0, m + 1, 0, err, taps)) return false;
         accepted = m;
         st.drafts_offered += n;
         st.drafts_accepted += m;
@@ -7469,7 +7503,14 @@ struct Model::Impl {
     }
 
     // ---- a window: T tokens at positions pos .. pos + T - 1 through every layer; the logits of its last `logits` rows
-    bool step(int token, bool want_logits, std::string& err) { return forward(&token, 1, want_logits ? 1 : 0, err); }
+    float* decode_taps(int T) const {
+        return T >= 1 && T <= kWin && !kHipBuild && devs.size() == 1 && !par && o.tp <= 1 &&
+                       dump_d == nullptr && dump_h == nullptr ? d_decode_taps : nullptr;
+    }
+
+    bool step(int token, bool want_logits, std::string& err) {
+        return forward(&token, 1, want_logits ? 1 : 0, err, -1, decode_taps(1));
+    }
 
 
     // layer L0 for a chunk of T tokens at p0 as group member mi: layer()'s arithmetic over the chunk's rows (the
@@ -9029,12 +9070,17 @@ struct Model::Impl {
 
     // the DSpark drafter's taps: the streams' mean entering target layer il, on device d (after the last seeding read
     // h_taps)
-    bool tap(Dev& d, int il, int T, std::string& err) {
+    bool tap(Dev& d, int il, int T, std::string& err, float* device_taps = nullptr) {
         const auto it = std::find(g.d_targets.begin(), g.d_targets.end(), il);
         if (g.n_mtp == 0 || it == g.d_targets.end()) return true;
         const size_t j = (size_t) (it - g.d_targets.begin()), nt = g.d_targets.size();
         const int D = g.dim;
         cudaSetDevice(d.id);
+        if (device_taps != nullptr) {
+            // Identical FP32 mean kernel/launch; only the output row stride changes.
+            hc_mean(d.h, T, g.hc, D, device_taps + j * D, (int) nt * D, d.st);
+            return true;
+        }
         hc_mean(d.h, T, g.hc, D, d.tap, D, d.st);
         CK(cudaStreamWaitEvent(d.st, ev_seed, 0));
         CK(cudaMemcpy2DAsync(h_taps + j * D, nt * D * 4, d.tap, (size_t) D * 4, (size_t) D * 4, (size_t) T,
@@ -9042,7 +9088,8 @@ struct Model::Impl {
         return true;
     }
 
-    bool forward(const int* tk, int T, int logits_rows, std::string& err, int seed_rows = -1) {
+    bool forward(const int* tk, int T, int logits_rows, std::string& err, int seed_rows = -1,
+                 float* device_taps = nullptr) {
         if (T < 1 || T > kWin) {
             err = "a window of " + std::to_string(T) + " tokens";
             return false;
@@ -9081,7 +9128,7 @@ struct Model::Impl {
         const double tl = now_ms();
         if (par) {
             if (!forward_par(p0, T, err)) return false;
-        } else if (!forward_serial(p0, T, err)) return false;
+        } else if (!forward_serial(p0, T, err, device_taps)) return false;
         st.layer_ms += now_ms() - tl;
         for (auto& b : eg_win)
             if (b->live) eg_finish(*b);
@@ -9099,12 +9146,12 @@ struct Model::Impl {
         pos += T;
         st.tokens += T;
         cache_tick(T);
-        if (seed_rows != 0 && !seed_drafter(p0, seed_rows < 0 ? T : seed_rows, 0, err)) return false;
+        if (seed_rows != 0 && !seed_drafter(p0, seed_rows < 0 ? T : seed_rows, 0, err, device_taps)) return false;
         return true;
     }
 
     // one thread: the layers device after device, the hand-offs through pinned memory and events
-    bool forward_serial(int64_t p0, int T, std::string& err) {
+    bool forward_serial(int64_t p0, int T, std::string& err, float* device_taps = nullptr) {
         const int D = g.dim, H = g.hc;
         int cur = L[0].dev;
         {
@@ -9138,7 +9185,7 @@ struct Model::Impl {
                 CK(cudaMemcpyAsync(b.cand, bb + nh + np + nk, nc, cudaMemcpyHostToDevice, b.st));
                 cur = l.dev;
             }
-            if (!tap(devs[(size_t) l.dev], il, T, err)) return false;
+            if (!tap(devs[(size_t) l.dev], il, T, err, device_taps)) return false;
             if (!layer(l, 0, p0, T, wplan, err)) return false;
             if (dump_h != nullptr) {   // DS4_DUMP_H: every layer's residual stream, for tools/ds4/compare.py --layers
                 Dev& dd = devs[(size_t) l.dev];

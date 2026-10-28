@@ -1,0 +1,8 @@
+{
+  "source_sha256": "7b353265f384a2660c644021768a153e91d15bbbd3ed2df224651f37d974b239",
+  "extracted_sha256": "e4375e6fcfab12dd7a67d3b0d41f6be41388a6ae1f9e2b829448cf6bd3a86481",
+  "source_checks_pass": true,
+  "cpu_double_only": true,
+  "model_runs": 0,
+  "cuda_runs": 0
+}
