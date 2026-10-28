@@ -500,6 +500,37 @@ __global__ void __launch_bounds__(kThreads) gemv_f32_kernel(const float* __restr
     if (lane == 0) y[(size_t) t * ldy + row] = acc;
 }
 
+// Direct kernel parameters, not a device-indexed by-value array. NJ removes the unused third job.
+// The selected row still uses the original float4/FMA and XOR reduction order.
+template <int NJ>
+__global__ void __launch_bounds__(kThreads) gemv_f32_router_static_kernel(
+    const float* __restrict__ W0, const float* __restrict__ W1, const float* __restrict__ W2,
+    float* __restrict__ Y0, float* __restrict__ Y1, float* __restrict__ Y2,
+    int n0, int n1, int n2, const float* __restrict__ x, int k, int ldy) {
+    const int j = blockIdx.z;
+    const float* __restrict__ W = j == 0 ? W0 : W1;
+    float* __restrict__ y = j == 0 ? Y0 : Y1;
+    int n = j == 0 ? n0 : n1;
+    if constexpr (NJ == 3) {
+        if (j == 2) { W = W2; y = Y2; n = n2; }
+    }
+    const int row = blockIdx.x * (kThreads / 32) + (threadIdx.x >> 5);
+    const int lane = threadIdx.x & 31, t = blockIdx.y;
+    if (row >= n) return;
+    const float4* w = (const float4*) (W + (size_t) row * k);
+    const float4* xv = (const float4*) (x + (size_t) t * k);
+    float acc = 0.0f;
+    for (int c = lane; c < k / 4; c += 32) {
+        const float4 a = w[c], b = xv[c];
+        acc = fmaf(a.x, b.x, acc);
+        acc = fmaf(a.y, b.y, acc);
+        acc = fmaf(a.z, b.z, acc);
+        acc = fmaf(a.w, b.w, acc);
+    }
+    acc = warp_sum(acc);
+    if (lane == 0) y[(size_t) t * ldy + row] = acc;
+}
+
 // ---------------------------------------------------------------- the router
 __global__ void __launch_bounds__(512) route_kernel(const float* __restrict__ logits, const float* __restrict__ bias,
                                                     int n, int k, float route_scale, int* idx, float* w,
@@ -2204,6 +2235,26 @@ void gemv_f16_rows(const uint16_t* W, const float* x, size_t ldx, int n, int k, 
 void gemv_f32(const float* W, const float* x, int n, int k, int T, float* y, int ldy, cudaStream_t s) {
     if (T > 0) gemv_f32_kernel<<<dim3(cdiv(n, kThreads / 32), T), kThreads, 0, s>>>(W, x, n, k, y, ldy);
 }
+
+void gemv_f32_router_static(const F32RouterJobs& jobs, const float* x, int k, int T, int ldy, cudaStream_t s) {
+    if (jobs.count <= 0 || jobs.count > 3 || T <= 0) return;
+    if (jobs.count == 1) {
+        gemv_f32(jobs.w[0], x, jobs.n[0], k, T, jobs.y[0], ldy, s);
+        return;
+    }
+    int n = 0;
+    for (int j = 0; j < jobs.count; ++j) n = std::max(n, jobs.n[j]);
+    const dim3 grid(cdiv(n, kThreads / 32), T, jobs.count);
+    if (jobs.count == 2)
+        gemv_f32_router_static_kernel<2><<<grid, kThreads, 0, s>>>(
+            jobs.w[0], jobs.w[1], nullptr, jobs.y[0], jobs.y[1], nullptr,
+            jobs.n[0], jobs.n[1], 0, x, k, ldy);
+    else
+        gemv_f32_router_static_kernel<3><<<grid, kThreads, 0, s>>>(
+            jobs.w[0], jobs.w[1], jobs.w[2], jobs.y[0], jobs.y[1], jobs.y[2],
+            jobs.n[0], jobs.n[1], jobs.n[2], x, k, ldy);
+}
+
 
 void route(const float* logits, const float* bias, int n, int k, int T, float route_scale, int* idx, float* w,
            cudaStream_t s, const float* bias_vl, const VlBits* vl) {
