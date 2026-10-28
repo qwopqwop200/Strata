@@ -433,7 +433,10 @@ def write_tokenizer(out: pathlib.Path, kv: dict, template: str | None):
     (out / "token_type.json").write_text(json.dumps([int(t) for t in types]))
     special = {"bos": int(kv.get("tokenizer.ggml.bos_token_id", 0)), "eos": int(kv.get("tokenizer.ggml.eos_token_id", 1)),
                "pad": int(kv.get("tokenizer.ggml.padding_token_id", 2))}
+    raw_special = {k: int(v) for k, v in kv.items()
+                   if k.startswith("tokenizer.ggml.") and k.endswith("_token_id")}
     tokenizer_config = {"pre": kv.get("tokenizer.ggml.pre", "deepseek3"), "special_ids": special,
+                        "gguf_special_ids": raw_special, "vocab_size": len(tokens), "n_merges": len(merges),
                         "add_bos_token": bool(kv.get("tokenizer.ggml.add_bos_token", False)),
                         "add_eos_token": bool(kv.get("tokenizer.ggml.add_eos_token", False))}
     (out / "tokenizer.json").write_text(json.dumps(tokenizer_config, indent=1))

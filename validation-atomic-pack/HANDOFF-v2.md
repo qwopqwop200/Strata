@@ -1,0 +1,15 @@
+# Atomic pack producer v2
+
+기존466c2578/63f2a750/oldvisionaux/frozen파일은보존하고새atomic-agent1-pack-v2에서만후속했습니다. 새팩은아직없고다운로드ALL_VERIFIED전실prepare금지입니다.
+
+실runtime의compact special_ids{bos,eos,pad}를유지하며tokenizer.json에vocab_size/n_merges/gguf_special_ids(원fullkeys)를추가했습니다. Atomic실원값joyai-llm/bos0/eos1/pad1/addflagsfalse를일관검증합니다. 실제원KV로pack export→ST.Tokenizer생성→compactEOS/PAD필드존재·원KV동일→12corpus같은ID/roundtrip를확인해default1에우연의존하지않습니다. native4의assets-v3정규화reader와조율했습니다.
+
+manifest는<pack>/atomic-pack-proof.json입니다. schema1/statusPACK_PREPARED_NOT_MODEL_VALIDATED/pack_root/model_root/actual_new_model_packtrue/files_verifiedtrue/target_repo/revision/exact4target_shards(repo/path/size/sha/revision)/original_auxiliaries6/tokenizer_source/mapping_proof/retained_Q4/pack_files_sha256/source_sha256를기록합니다. model_acceptance_pass/vision_pass/context1M_pass는false로별도actual검증필요를명시합니다.
+
+mapping_proof는원1004tensor→47244runtimebyteviews를dtype/shape/offset/name모두정확대조하고newroot밖fileclosure를거절합니다. mapped_files 각record에fileindex/path/size/device/inode/mtime_ns/ctime_ns/checksum/checksum_kind를기록합니다. stable_identity_fields는device/inode/size/mtime_ns입니다. ctime는oldhardlinkalias삭제로정상변경될수있어영구동일조건이아닙니다.
+
+retained_Q4는원선택46mtp-only +converted_bounds_verifiedtrue/converted_dtypeQ4_K/draft_bytes317620224/converted_tensors{name:{dtype,offset,bytes,shape}}를기록해실tensors.txt행및부모retentionmanifest와조인할수있습니다. 모든non-MTP target/기존filemap/원문헤더·주석불변,oldtargetpayload수정0입니다.
+
+write_tokenizer는직접JSON을쓰므로원packexport에Qwenpre_pattern오표기가있었다는주장은하지않습니다. agent4원tokenizer.extract의label수리는그별도경로이며현재양쪽source파일은동일released04d원본을사용합니다.
+
+v2header-probes는v1수신prefix에서data_start까지의정확header만별도복사했습니다. v1보존/새v2에는tensorpayload저장0. 전체GGUF검증이아니며실pack은반드시completedactualfiles를다시읽습니다.

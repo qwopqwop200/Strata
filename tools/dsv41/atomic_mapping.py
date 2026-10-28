@@ -43,7 +43,7 @@ def verify_pack(pack,root,manifest):
         p=(model/name).resolve()
         if not p.is_relative_to(root)or str(p)not in known:raise ValueError('dependency outside verified new-root closure '+str(p))
         if p.stat().st_size!=known[str(p)].get('size'):raise ValueError('dependency size mismatch '+str(p))
-        closure.append(dict(file=i,path=str(p),size=p.stat().st_size,checksum=known[str(p)].get('sha256')or known[str(p)].get('git_blob'),verified_by='download ALL_VERIFIED or retained parent manifest'))
+        st=p.stat();closure.append(dict(file=i,path=str(p),size=st.st_size,device=st.st_dev,inode=st.st_ino,mtime_ns=st.st_mtime_ns,ctime_ns=st.st_ctime_ns,checksum=known[str(p)].get('sha256')or known[str(p)].get('git_blob'),checksum_kind='sha256'if known[str(p)].get('sha256')else'git_blob_sha1',verified_by='download ALL_VERIFIED or retained parent manifest'))
     target_paths={str(p.resolve())for p in paths}
     for n,t in table.items():
         p=(model/files[int(t[3])]).resolve();off,nb=int(t[4]),int(t[5]);shape=list(map(int,t[6:]));dt=t[2]
@@ -51,4 +51,4 @@ def verify_pack(pack,root,manifest):
         if str(p)in target_paths:actual[n]=[str(p),dt,off,nb,shape]
         elif n in expected:raise ValueError('Atomic target silently replaced by auxiliary '+n)
     if actual!=expected:raise ValueError('Atomic dtype/offset/shape/name views differ; missing='+str(sorted(expected.keys()-actual.keys())[:4]))
-    return dict(pass_=True,target_source_tensor_count=count,target_runtime_tensor_count=len(expected),target_tensor_offsets_verified=True,target_dtype_preserved=True,target_tensor_byte_views_exact=True,target_mapping_sha256=hashlib.sha256(json.dumps(expected,sort_keys=True,separators=(',',':')).encode()).hexdigest(),mapped_files=closure,limits='Header+mapping proof over downloader whole-file checksum verified inputs; no redundant per-tensor payload rehash.')
+    return dict(pass_=True,target_source_tensor_count=count,target_runtime_tensor_count=len(expected),target_tensor_offsets_verified=True,target_dtype_preserved=True,target_tensor_byte_views_exact=True,stable_identity_fields=['device','inode','size','mtime_ns'],ctime_scope='advisory only; unlinking old hardlink aliases changes ctime without payload change',target_mapping_sha256=hashlib.sha256(json.dumps(expected,sort_keys=True,separators=(',',':')).encode()).hexdigest(),mapped_files=closure,limits='Header+mapping proof over downloader whole-file checksum verified inputs; no redundant per-tensor payload rehash.')

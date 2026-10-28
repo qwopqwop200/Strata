@@ -1,0 +1,22 @@
+{
+  "status": "PRODUCER_V2_SOURCE_READY_NO_ACTUAL_PACK",
+  "writer_released": true,
+  "source_sha256": {
+    "/home/qwopqwop200/Strata-tuning/upstream-027/atomic-agent1-pack-v2/tools/dsv41/pack_gguf.py": "2a2646c21e88851d24352f3e5fcbacfa7b76711b71b0f7f3aa0f0112b59e9071",
+    "/home/qwopqwop200/Strata-tuning/upstream-027/atomic-agent1-pack-v2/tools/dsv41/atomic_prepare.py": "65c719a95b590e88e4d860772a7d65df281198113775e7d9d081a9d239e3b174",
+    "/home/qwopqwop200/Strata-tuning/upstream-027/atomic-agent1-pack-v2/tools/dsv41/atomic_mapping.py": "bac20aeb715ad65a2637c67e22596c22bcb0df9e476839c52e8fd5a1d9f7613d",
+    "/home/qwopqwop200/Strata-tuning/upstream-027/atomic-agent1-pack-v2/tools/dsv41/retained_draft.py": "1a896c591a12e068f43fc0bc97d31e1b09bf174e7c1ae6fed1e12b7cb5a84c79",
+    "/home/qwopqwop200/Strata-tuning/upstream-027/atomic-agent1-pack-v2/tools/strata_tokenizer.py": "f47a65e1cdd701513f0a99e445d319d9438728c73042c57eff74ffec1b409a96"
+  },
+  "legacy_v1_unchanged": true,
+  "tokenizer_runtime_contract": "compact bos/eos/pad preserved; gguf_special_ids raw provenance exact",
+  "consumer_followup": "atomic-agent4-assets-v3 reader owner controls peer files",
+  "light_CPU_tests": {
+    "aux": 6,
+    "retained": 2,
+    "actual_export_JoyAI_corpus": 12
+  },
+  "new_model_pack_prepared": false,
+  "model_runs": 0,
+  "GPU_runs": 0
+}
