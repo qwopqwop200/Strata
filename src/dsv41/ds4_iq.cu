@@ -1287,9 +1287,27 @@ bool light_set(const SetArgs& a, bool gu, cudaStream_t s) {
     return true;
 }
 
+// Opt-in dense K-quant decode GEMV column capacity. Keep all other types and
+// column counts on the original 1/4/16 kernels. Parse once, no runtime logging.
+bool exact_dense_columns() {
+    static const bool enabled=[] {
+        const char* v=std::getenv("DS4_IQ_EXACT_COLS");
+        return v!=nullptr && std::atoi(v)==1;
+    }();
+    return enabled;
+}
+
 template <int T>
 void mv_nc(const Jobs& J, int nj, int max_n, int max_c, cudaStream_t s) {
     const dim3 grid((unsigned) ((max_n + kWarps - 1) / kWarps), (unsigned) nj);
+    if constexpr (T==kQ5_K || T==kQ6_K) {
+        if (exact_dense_columns()) {
+            if constexpr (T==kQ6_K) {
+                if (max_c==2) { mv_kernel<T, 2><<<grid, kThreads, 0, s>>>(J); return; }
+            }
+            if (max_c==6) { mv_kernel<T, 6><<<grid, kThreads, 0, s>>>(J); return; }
+        }
+    }
     if (max_c <= 1) mv_kernel<T, 1><<<grid, kThreads, 0, s>>>(J);
     else if (max_c <= 4) mv_kernel<T, 4><<<grid, kThreads, 0, s>>>(J);
     else mv_kernel<T, 16><<<grid, kThreads, 0, s>>>(J);
