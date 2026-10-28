@@ -12,6 +12,7 @@
 //   moe(x): 6 of 384 routed experts (sqrt-softplus scores, biased top-k) + the shared expert
 //   h = post * moe + comb^T h;  pre = f_pre
 // and after the last layer logits = head(rmsnorm(sum_s pre[s] h[s])).
+#include "ds4_context_capacity.hpp"
 #include "ds4_launch.h"   // strata_ds4_launch: <<<>>> on CUDA and HIP, a dispatch on Metal
 #include "ds4_model.hpp"
 #include "ds4_pick_rule.hpp"
@@ -2134,6 +2135,21 @@ struct Model::Impl {
                   std::to_string(g.ix_hd) + ", experts per token " + std::to_string(g.k_exp) + ")";
             return false;
         }
+        // ATOMIC_CONTEXT_CAPACITY_BEGIN
+        // Explicit real-model capacity audit, before CUDA contexts or large allocations.
+        // Math, cache layout, compression and YOCO policy are unchanged when enabled.
+        if (context_capacity::requested(std::getenv("DS4_CONTEXT_CAPACITY_CHECK"))) {
+            context_capacity::Plan capacity;
+            if (!context_capacity::make((int64_t) pk.num("max_position_embeddings", 0), o.max_context, g.nl, g.hd, g.ix_hd,
+                                        g.cand_blk, o.prefill_chunk > 0, g.ratios, g.kv_src, capacity, err))
+                return false;
+            std::fprintf(stderr, "ds4 context capacity: requested=1 metadata_max=%llu context=%llu source_rows=%llu largest_source_rows=%llu source_cache_bytes=%llu decode_score_bytes=%llu prefill_score_bytes=%llu index_slab_rows=%d accounting=partial_single_device completion_certified=0\n",
+                         (unsigned long long) capacity.max_positions, (unsigned long long) capacity.context,
+                         (unsigned long long) capacity.source_rows, (unsigned long long) capacity.largest_source_rows,
+                         (unsigned long long) capacity.source_cache_bytes, (unsigned long long) capacity.decode_score_bytes,
+                         (unsigned long long) capacity.prefill_score_bytes, capacity.index_slab_rows);
+        }
+        // ATOMIC_CONTEXT_CAPACITY_END
         freqs_win = rope_freqs(g.rd, 0, g.rope_theta, g.factor, g.beta_fast, g.beta_slow);
         freqs_comp = rope_freqs(g.rd, g.orig_ctx, g.comp_theta, g.factor, g.beta_fast, g.beta_slow);
 

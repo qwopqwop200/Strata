@@ -1,0 +1,22 @@
+{
+  "status": "PASS",
+  "CPU_compiles": 1,
+  "CPU_runs": 1,
+  "CUDA_GPU_model_runs": 0,
+  "capacity_PASS": false,
+  "source_unchanged": true,
+  "input_sha256": {
+    "/home/qwopqwop200/Strata-tuning/upstream-027/atomic-agent3-context-v1/src/dsv41/ds4_context_capacity.hpp": "6a80ec13060c8eca580bee9f174f4f2c7bcaf7e5c155a1fcef46b33dad032517",
+    "/home/qwopqwop200/Strata-tuning/upstream-027/atomic-agent3-context-v1/src/dsv41/ds4_model.cu": "09a2ae1b0a0efd5c0d8845e5da6e6983a49818f79003b7b12c9c556529833608",
+    "/home/qwopqwop200/Strata-tuning/upstream-027/atomic-agent3-context-v1/src/dsv41/ds4_main.cpp": "789f2425fdd25b1bbe0f6642916501b60b1a47d5daab2d54e9c918b9a80344c7",
+    "/home/qwopqwop200/Strata-tuning/upstream-027/atomic-agent3-context-v1/validation-context/test_contract.py": "49810e25438f5a7430f14c0d3bfea642dc67be1012daede6885f25e2307a3ac5",
+    "/home/qwopqwop200/Strata-tuning/upstream-027/atomic-agent3-context-v1/validation-context/run_cpu.py": "ddb8df88a183096fdd553ce972ab42eb1dada3bd7a9041f2895ffc9fa4a034ff",
+    "/home/qwopqwop200/Strata-tuning/upstream-027/atomic-agent3-context-v1/validation-context/source_proof.py": "46fa25c00d93c2cadc4b194dc1d368db8b73d2499f7616533abb2353d41082fe",
+    "/home/qwopqwop200/Strata-tuning/upstream-027/atomic-agent3-context-v1/validation-context/test_capacity.cpp": "5f0018facdb445890687396229d9ccd16fc6c52dbcc220ffa9d766518b5eda8b",
+    "/home/qwopqwop200/Strata-tuning/upstream-027/atomic-agent3-context-v1/tools/atomic_context/preflight.py": "ccc6c3fb20a2aaaf897b6f7b5e22d6163e2c0217fd258dd278459ed7b501f422",
+    "/home/qwopqwop200/Strata-tuning/upstream-027/atomic-agent3-context-v1/tools/atomic_context/validate_run.py": "93282164228c02e8ce4f0d12845e6095d7b739de0f7239d29adf5a572ea69853",
+    "/home/qwopqwop200/Strata-tuning/upstream-027/atomic-agent3-context-v1/tools/atomic_context/capacity.py": "37ec65695f5aadcc249c2956fda2a73ed97b27371c06c859d05cd5d4d6a7e3ba",
+    "/home/qwopqwop200/Strata-tuning/upstream-027/criticalpath-q5-preload-v1/validation-q5-preload/gpu-component-v3/run_cuda.py": "e43986d44db0148b7ac57cbdff33fc4c5d240c45fcd8ba681be224d287a7ee0a"
+  },
+  "elapsed_after_lock_s": 0.44965344900265336
+}

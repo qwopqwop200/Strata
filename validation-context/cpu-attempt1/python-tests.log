@@ -1,0 +1,8 @@
+test_historical_geometry_formulas_only (__main__.Contracts.test_historical_geometry_formulas_only) ... ok
+test_integer_fingerprint_contract (__main__.Contracts.test_integer_fingerprint_contract) ... ok
+test_synthetic_full_input_closure_and_negative_truncation (__main__.Contracts.test_synthetic_full_input_closure_and_negative_truncation) ... ok
+
+----------------------------------------------------------------------
+Ran 3 tests in 0.005s
+
+OK

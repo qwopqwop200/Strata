@@ -1,0 +1,22 @@
+{
+  "status": "RUNTIME_READY_PARENT_INTEGRATION_CUDA_PENDING",
+  "writer_released": true,
+  "base": "b761fe96147349a23825f442db7b33a21dd45278",
+  "sha256": {
+    "src/dsv41/ds4_context_capacity.hpp": "6a80ec13060c8eca580bee9f174f4f2c7bcaf7e5c155a1fcef46b33dad032517",
+    "src/dsv41/ds4_model.cu": "09a2ae1b0a0efd5c0d8845e5da6e6983a49818f79003b7b12c9c556529833608",
+    "src/dsv41/ds4_main.cpp": "789f2425fdd25b1bbe0f6642916501b60b1a47d5daab2d54e9c918b9a80344c7",
+    "tools/atomic_context/capacity.py": "37ec65695f5aadcc249c2956fda2a73ed97b27371c06c859d05cd5d4d6a7e3ba",
+    "validation-context/test_capacity.cpp": "5f0018facdb445890687396229d9ccd16fc6c52dbcc220ffa9d766518b5eda8b",
+    "validation-context/test_contract.py": "49810e25438f5a7430f14c0d3bfea642dc67be1012daede6885f25e2307a3ac5",
+    "validation-context/source_proof.py": "46fa25c00d93c2cadc4b194dc1d368db8b73d2499f7616533abb2353d41082fe",
+    "validation-context/run_cpu.py": "ddb8df88a183096fdd553ce972ab42eb1dada3bd7a9041f2895ffc9fa4a034ff",
+    "validation-context/SOURCE-PROOF.json": "08bd9805790148d6459176cb43d601bd75daa1e78b6bd8d8073ab0b5f6c8218d",
+    "validation-context/RUNTIME-HANDOFF.md": "f6d453788c5a060d46f66be6e043f9a2b782e592426e255cd883388d17a79dad",
+    "validation-context/cpu-attempt1/result.json": "242534cdce96ac4f004ef118ce625e99ffac73bd28eb3467259a99693c46abc3"
+  },
+  "CPU_PASS": true,
+  "CUDA_GPU_model_runs": 0,
+  "Atomic_1M_PASS": false,
+  "component_binary_sha256": "e86b76061fed58c226c5e78c86496ca371d2e853cfab855fb45aa898c902dfe3"
+}

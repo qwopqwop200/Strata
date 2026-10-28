@@ -26,6 +26,7 @@
 #endif
 #include "ds4_launch.h"   // ds4_dbg
 #include "ds4_model.hpp"
+#include "ds4_context_capacity.hpp"
 #include "ds4_experts_rule.hpp"
 #include "ds4_os.hpp"
 #include "ds4_packinfo.hpp"
@@ -900,6 +901,22 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
             held.clear();
             continue;
         }
+        // ATOMIC_CONTEXT_INPUT_BEGIN
+        if (strata::ds4::context_capacity::requested(std::getenv("DS4_CONTEXT_CAPACITY_CHECK"))) {
+            const bool matched = m.pos() == (int64_t) r.ids.size() && done == r.ids.size();
+            const uint64_t fingerprint = strata::ds4::context_capacity::input_fingerprint(r.ids.data(), r.ids.size());
+            std::fprintf(stderr, "ds4 context input: requested=1 input_tokens=%zu fresh_from=%zu prompt_read=%zu engine_position=%lld context=%lld reuse_enabled=%d input_fnv64=%016llx full_input_position_match=%d\n",
+                         r.ids.size(), from, done - from, (long long) m.pos(), (long long) m.max_context(),
+                         reuse ? 1 : 0, (unsigned long long) fingerprint, matched ? 1 : 0);
+            if (!matched) {
+                std::printf("ERR context input position mismatch\n");
+                std::fflush(stdout);
+                m.reset();
+                held.clear();
+                continue;
+            }
+        }
+        // ATOMIC_CONTEXT_INPUT_END
         held = std::move(pics);
         m.checkpoint(0);
         if (!continued && slot_max > 0) m.pin();   // (a new run of prompts: where it may be rendered again from)
