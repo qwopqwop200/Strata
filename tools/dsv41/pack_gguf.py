@@ -30,6 +30,8 @@ v1.1.17 put it) when it is whole.
 from __future__ import annotations
 
 import argparse
+import hashlib
+import math
 import json
 import os
 import pathlib
@@ -431,9 +433,46 @@ def write_tokenizer(out: pathlib.Path, kv: dict, template: str | None):
     (out / "token_type.json").write_text(json.dumps([int(t) for t in types]))
     special = {"bos": int(kv.get("tokenizer.ggml.bos_token_id", 0)), "eos": int(kv.get("tokenizer.ggml.eos_token_id", 1)),
                "pad": int(kv.get("tokenizer.ggml.padding_token_id", 2))}
-    (out / "tokenizer.json").write_text(json.dumps({"pre": "deepseek3", "special_ids": special}, indent=1))
+    tokenizer_config = {"pre": kv.get("tokenizer.ggml.pre", "deepseek3"), "special_ids": special,
+                        "add_bos_token": bool(kv.get("tokenizer.ggml.add_bos_token", False)),
+                        "add_eos_token": bool(kv.get("tokenizer.ggml.add_eos_token", False))}
+    (out / "tokenizer.json").write_text(json.dumps(tokenizer_config, indent=1))
     if template:
         (out / "chat_template.jinja").write_text(template, encoding="utf-8")
+
+
+def add_vision_router_bias(files, tensors, model: pathlib.Path, source: pathlib.Path, layers: int, experts: int):
+    """Map an explicit original-checkpoint auxiliary bias; never replace a target tensor."""
+    source = source.expanduser().resolve()
+    if layers <= 0 or experts <= 0 or layers * experts > (1 << 20):
+        raise SystemExit("vision router bias: invalid model shape")
+    expected = layers * experts * 4
+    if not source.is_file() or source.stat().st_size != expected:
+        raise SystemExit("vision router bias: expected exactly %d F32 bytes" % expected)
+    raw = source.read_bytes()
+    if not all(math.isfinite(v) for v in struct.unpack("<%df" % (layers * experts), raw)):
+        raise SystemExit("vision router bias: nonfinite F32 auxiliary values")
+    names = {t[0]: t for t in tensors}
+    missing = []
+    for il in range(layers):
+        name = "layers.%d.ffn.gate.bias_vl" % il
+        if name in names:
+            if names[name][1] != "F32" or names[name][4:] != (experts * 4, [experts]):
+                raise SystemExit("vision router bias: existing target tensor shape/type differs: " + name)
+        else:
+            missing.append((name, il * experts * 4))
+    rel = os.path.relpath(source, model).replace(os.sep, "/")
+    if any(c.isspace() for c in rel):
+        raise SystemExit("vision router bias: whitespace in file path is unsupported")
+    if missing:
+        if rel not in files:
+            files.append(rel)
+        fi = files.index(rel)
+        tensors.extend((name, "F32", fi, off, experts * 4, [experts]) for name, off in missing)
+    return {"kind": "original_vision_router_bias_missing_only", "source": str(source),
+            "sha256": hashlib.sha256(raw).hexdigest(), "bytes": len(raw),
+            "shape": [layers, experts], "mapped_tensors": [name for name, _ in missing],
+            "target_tensors_replaced": 0, "weight_bytes_copied_or_modified": False}
 
 
 def main() -> int:
@@ -445,6 +484,8 @@ def main() -> int:
     ap.add_argument("--dspark-gguf", help="unsloth's DSpark drafter GGUF (dspark-*-Q8_0.gguf, architecture dflash): its three "
                                           "blocks become mtp.0-2 beside the trunk's tensors (default: the first dspark-*.gguf "
                                           "in <model>/.. when there is one)")
+    ap.add_argument("--vision-router-bias", help="explicit original F32 [trunk_layers,experts] image-routing bias; only missing bias_vl tensors are mapped, no target replaced")
+    ap.add_argument("--chat-template", help="explicit pinned original chat-template UTF-8 file, instead of the embedded template; recorded as an auxiliary input")
     ap.add_argument("--mmproj", help="unsloth's vision tower GGUF (mmproj-*.gguf, clip / deepseek41v): its tensors become the "
                                      "checkpoint's vision.* / aligner.* (default: the first mmproj*.gguf in <model>/.. whose projector is deepseek41v; other families' are ignored)")
     ap.add_argument("--tq-experts", nargs="+", help="folders tq_convert.py wrote (tq.json + tq-L<layer>.bin): the routed experts of the layers "
@@ -884,6 +925,7 @@ def main() -> int:
                                     off + i * (nb // groups), nb // groups, [shape[0] // groups, shape[1]]))
                 continue
             tensors.append((name, dt, len(files) - 1, off, nb, shape))
+    auxiliary_inputs = []
     # the vision tower (vision_pack.py's vision.bin, from DeepSeek's checkpoint): its tensors under the checkpoint's
     # names, the picture span's marker rows, and the geometry config.json gives them
     vdir = pathlib.Path(a.vision).expanduser().resolve() if a.vision else model.parent / "vision"
@@ -904,6 +946,9 @@ def main() -> int:
         vision = mm_geo
     vocab = next(t[5][0] for t in tensors if t[0] == "embed.weight")
     geo = geometry(kv, vocab)
+    if a.vision_router_bias:
+        auxiliary_inputs.append(add_vision_router_bias(files, tensors, model, pathlib.Path(a.vision_router_bias),
+                                                      int(geo["num_hidden_layers"]), int(geo["n_routed_experts"])))
 
     out.mkdir(parents=True, exist_ok=True)
     with (out / "ds4.txt").open("w") as f:
@@ -927,9 +972,20 @@ def main() -> int:
     # checked: chat, thinking, effort, system, multi-turn, tools, tool results).  Project Maya's tools/ds4/chat_template.jinja
     # lost the tool associations and later system instructions (their #299), so it is NOT used here.
     template = kv.get("tokenizer.chat_template")
+    if a.chat_template:
+        template_path = pathlib.Path(a.chat_template).expanduser().resolve()
+        if not template_path.is_file() or not 0 < template_path.stat().st_size <= (1 << 20):
+            raise SystemExit("chat template: expected a nonempty UTF-8 file <=1MiB")
+        raw_template = template_path.read_bytes()
+        template = raw_template.decode("utf-8")
+        auxiliary_inputs.append({"kind": "explicit_original_chat_template", "source": str(template_path),
+                                 "sha256": hashlib.sha256(raw_template).hexdigest(), "bytes": len(raw_template)})
     if not template:
         sys.exit("%s: the GGUF has no tokenizer.chat_template; refusing to fall back to the old Maya template (#299)" % model)
     write_tokenizer(out / "tokenizer", kv, template)
+    if auxiliary_inputs:
+        (out / "auxiliary-inputs.json").write_text(json.dumps({"schema": 1, "inputs": auxiliary_inputs,
+                                                              "target_weight_tensors_replaced": 0}, indent=2) + "\n")
     by = {}
     for t in tensors:
         by[t[1]] = by.get(t[1], 0) + t[4]
