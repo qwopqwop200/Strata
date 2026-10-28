@@ -1062,6 +1062,11 @@ struct Model::Impl {
         const char* v = std::getenv("DS4_ROUTER_GEMV_STATIC_BATCH");
         return v != nullptr && std::strcmp(v, "1") == 0;
     }();
+    // Written only by the serial single-GPU Model owner; no worker or warm-up writes.
+    // Submitted path counts, not a CUDA completion or GPU-duration measurement.
+    uint64_t router_owner_async = 0, router_groups3 = 0;
+    uint64_t router_fallback_shape = 0, router_fallback_ahead = 0, router_fallback_near = 0;
+    uint64_t router_t3[4] = {};
     int ahead_mode = std::getenv("DS4_AHEAD") ? std::atoi(std::getenv("DS4_AHEAD")) : 1;
     int ahead_extra = std::getenv("DS4_AHEAD_EXTRA") ? std::atoi(std::getenv("DS4_AHEAD_EXTRA")) : 0;
     // (DS4_AHEAD_ORDER=0: the CPU lane computes a layer's experts in expert order, not the ones asked for early first)
@@ -1327,6 +1332,14 @@ struct Model::Impl {
             }
         quit.store(true);
         if (service.joinable()) service.join();
+        if (router_gemv_static_batch)
+            std::fprintf(stderr, "ds4 router static batch: requested=1 owner_async=%llu groups3=%llu groups2=0 groups1=0 t1=%llu t2=%llu t3=%llu t4=%llu fallback_shape=%llu fallback_ahead=%llu fallback_near=%llu scope=model_lifetime_serial_single_gpu_async submitted_only=1 kernel_completion_certified=0\n",
+                         (unsigned long long) router_owner_async, (unsigned long long) router_groups3,
+                         (unsigned long long) router_t3[0], (unsigned long long) router_t3[1],
+                         (unsigned long long) router_t3[2], (unsigned long long) router_t3[3],
+                         (unsigned long long) router_fallback_shape, (unsigned long long) router_fallback_ahead,
+                         (unsigned long long) router_fallback_near);
+
         if (demand_prepare) {
             const auto ds = demand_prepare->stats();
             std::fprintf(stderr, "ds4 demand pipeline: batches %llu ranges %llu cancelled %llu prepare_ms %.3f tail_ms %.3f (overlapping wall times)\n",
@@ -9575,8 +9588,21 @@ struct Model::Impl {
             // the routing goes to the service thread through the mailbox (a group's lead publishes it, the members
             // make the same plan) while the device runs the shared expert and the VRAM experts (from the plan the
             // router made), and waits for the answer only before the experts' sum
-            const bool batch_router = router_gemv_static_batch && !kHipBuild && devs.size() == 1 && !par && nm == 1 &&
-                                      D == 5120 && T >= 1 && T <= 6;
+            const bool router_owned = router_gemv_static_batch && !kHipBuild && devs.size() == 1 && !par &&
+                                      nm == 1 && mi == 0;
+            const Layer* router_next[2] = {};
+            bool batch_router = false;
+            if (router_owned) {
+                ++router_owner_async;
+                if (D != 5120 || T < 1 || T > 4) ++router_fallback_shape;
+                else if (ahead_mode < 2) ++router_fallback_ahead;
+                else {
+                    router_next[0] = ahead_layer(L0, 1);
+                    if (router_next[0] != nullptr) router_next[1] = ahead_layer(L0, 2);
+                    if (router_next[1] != nullptr) batch_router = true;
+                    else ++router_fallback_near;
+                }
+            }
             if (!batch_router) gemv_f32(l.gate_w, d.x, l.n_exp, D, T, d.glog, 1024, s);
             const unsigned sq = wp.seq[l.il];
             const int slot = (int) (sq % kRing);
@@ -9588,21 +9614,20 @@ struct Model::Impl {
                 jobs.y[0] = d.glog;
                 jobs.n[0] = l.n_exp;
                 jobs.count = 1;
-                const Layer* next[2] = {};
-                for (int a = 1; lead && a <= std::min(2, ahead_mode); ++a) {
-                    const Layer* nx = ahead_layer(L0, a);
-                    if (nx == nullptr) break;
-                    next[a - 1] = nx;
+                for (int a = 1; a <= 2; ++a) {
+                    const Layer* nx = router_next[a - 1];
                     jobs.w[a] = nx->gate_w;
                     jobs.y[a] = d.glog_a + (size_t) (a - 1) * kWin * 1024;
                     jobs.n[a] = nx->n_exp;
                     ++jobs.count;
                 }
                 gemv_f32_router_static(jobs, d.x, D, T, 1024, s);
+                ++router_groups3;
+                ++router_t3[T - 1];
                 // Publish no early hint: each independent logit matrix is now ready on the same stream.
                 // Preserve ahead rank, offset, selection arithmetic and final mailbox publication order.
                 for (int a = 1; a < jobs.count; ++a) {
-                    const Layer* nx = next[a - 1];
+                    const Layer* nx = router_next[a - 1];
                     const int m = a == 1 ? std::max(1, std::min(kAhead1, nx->k_exp + ahead_extra)) : std::min(kPicks, nx->k_exp);
                     route_ahead(jobs.y[a], nx->gate_bias, nx->n_exp, m, T, reqs + slot, (a - 1) * kAhead1, s);
                     na[a - 1] = m;
