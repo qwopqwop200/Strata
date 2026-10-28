@@ -2542,7 +2542,7 @@ struct Model::Impl {
             CK(cudaEventCreateWithFlags(&ev_seed, cudaEventDisableTiming));
             CK(cudaEventRecord(ev_seed, devs[(size_t) d_dev].st));
             // Bound the optional allocation to the current pack. Prefill and dumps keep their host taps.
-            if (device_taps_requested && !kHipBuild && devs.size() == 1 && !par && o.tp <= 1 &&
+            if (device_taps_requested && !kHipBuild && devs.size() == 1 && !par && tp == 1 &&
                 d_dev == 0 && head_dev == 0 && dump_d == nullptr && dump_h == nullptr &&
                 g.dim == 5120 && g.d_targets.size() == 3) {
                 Dev& d = devs[0];
@@ -7504,7 +7504,7 @@ struct Model::Impl {
 
     // ---- a window: T tokens at positions pos .. pos + T - 1 through every layer; the logits of its last `logits` rows
     float* decode_taps(int T) const {
-        return T >= 1 && T <= kWin && !kHipBuild && devs.size() == 1 && !par && o.tp <= 1 &&
+        return T >= 1 && T <= kWin && !kHipBuild && devs.size() == 1 && !par && !L.empty() && L[0].nm == 1 &&
                        dump_d == nullptr && dump_h == nullptr ? d_decode_taps : nullptr;
     }
 
