@@ -95,7 +95,7 @@ private:
         }
     }
     void loop() {
-        uint64_t seen = gen_.load();
+        uint64_t seen = 0;
         for (;;) {
             const auto t0 = std::chrono::steady_clock::now();
             uint64_t g;
