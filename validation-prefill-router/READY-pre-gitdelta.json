@@ -1,0 +1,29 @@
+{
+  "status": "READY_COMPONENT_ONLY",
+  "writer_released": true,
+  "source_sha256": "0a5e66008f996d2e636258e9fd9500cdd79e14634a01606542823bafca8504fd",
+  "freeze_sha256": "73afc0eeea4deac11346bc5c850f9304b3ade3054de3817044631052df2001f3",
+  "cpu_source_tests": 6,
+  "gpu_compile_run": 0,
+  "common_lock": "/home/qwopqwop200/Strata-tuning/.validation.lock",
+  "STOP": "/home/qwopqwop200/Strata-tuning/upstream-027/STOP",
+  "command": [
+    "python3",
+    "-B",
+    "/home/qwopqwop200/Strata-tuning/upstream-027/open-prefill-router-reuse-v1/validation-prefill-router/run_gpu.py"
+  ],
+  "budget_s": 120,
+  "compile_jobs": 1,
+  "GPU_runs": 1,
+  "bit_cases": 6,
+  "timing_batches": 8,
+  "max_controlled_host_gpu_bytes": 1073741824,
+  "model_jobs": 0,
+  "activation": {
+    "env": "DS4_PREFILL_ROUTER_REUSE",
+    "value": "1",
+    "prefix": "ds4 prefill router reuse:",
+    "required": "dispatch_selected=1 tokens_per_warp=2 first_T=17 n=384 k=5120 ldy=1024 scope=process_first_dispatch kernel_completion_certified=0",
+    "scope_limit": "first dispatch; not completion/frequency/gain"
+  }
+}

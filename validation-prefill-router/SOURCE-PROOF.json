@@ -1,0 +1,16 @@
+{
+  "base": "1d86877331c4632abe1c0282ce65b96b4445bd92",
+  "whole_OFF_inverse": true,
+  "original_kernel_unchanged": true,
+  "actual_shape": {
+    "name": "layers.0.ffn.gate.weight",
+    "path": "/home/qwopqwop200/models/Abiray-DeepSeek-V4.1-IQ2_XXS/DeepSeek-V4.1-Flash-1017-GSQ-RCO-IQ2_XXS-00004-of-00004.gguf",
+    "offset": 14919322496,
+    "bytes": 3932160,
+    "n": 384,
+    "k": 5120
+  },
+  "actual_prefill_callsite": "ds4_model.cu:8295 gemv_f32(l.gate_w,c.x,l.n_exp,D,T,c.glog,1024,s)",
+  "arithmetic": "four explicit fmaf per float4 and identical warp XOR reduction for each token",
+  "limits": "T>16 and <=8192 only; original static/decode untouched"
+}
