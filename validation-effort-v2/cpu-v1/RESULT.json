@@ -1,0 +1,36 @@
+{
+  "status": "PASS",
+  "command": [
+    "/home/qwopqwop200/Strata-spark/.venv/bin/python",
+    "-B",
+    "-m",
+    "unittest",
+    "serve.test_atomic_effort",
+    "-v"
+  ],
+  "owned_pid": 2970106,
+  "owned_returncode": 0,
+  "owned_reaped": true,
+  "timeout": false,
+  "source_prepost_equal": true,
+  "source_sha256": {
+    "/home/qwopqwop200/Strata-tuning/upstream-027/atomic-agent4-frontend-effort-v2/serve/test_atomic_effort.py": "81cf9d158adc205a85502a49bb1a97402382be106588a81426215d23f921e9e2",
+    "/home/qwopqwop200/Strata-tuning/upstream-027/atomic-agent4-frontend-effort-v2/tools/strata_tokenizer.py": "f47a65e1cdd701513f0a99e445d319d9438728c73042c57eff74ffec1b409a96",
+    "/home/qwopqwop200/Strata-tuning/upstream-027/atomic-agent4-frontend-effort-v2/serve/frontend.py": "79ecf295e91e7c2c21aad51bc9bf101a86b0b4c6296b6c9b654e78028e87310e",
+    "/home/qwopqwop200/Strata-tuning/upstream-027/atomic-agent4-frontend-effort-v2/serve/dsml.py": "27717ea9099dcdff1f61203d5104c9cab1a3e3b45962edcfa02d5586e723255d",
+    "/home/qwopqwop200/Strata-tuning/upstream-027/atomic-agent4-frontend-effort-v2/atomic_regression/render_request.py": "c7612847acb6cdda59ebae465200519c4a1bb4185dd34a31fce5229da49691fc",
+    "/home/qwopqwop200/Strata-tuning/upstream-027/atomic-agent4-frontend-effort-v2/atomic_regression/frontend_assets.py": "74fa86a86c4fe72f731927569cda359b89aa64c0d6107a37d95e1e0a091321b4",
+    "/home/qwopqwop200/Strata-tuning/upstream-027/atomic-agent4-frontend-effort-v2/atomic_regression/test_frontend_assets.py": "f176ee30b018ec45c1db3f3e70e245b48a47dd133871a8e3fd2e8ecfbad1f687",
+    "/home/qwopqwop200/Strata-tuning/upstream-027/atomic-agent4-frontend-effort-v2/atomic_regression/materialize_header_tokenizer.py": "8a23971cb76245a16885df8b5772d91115768776d840bd29034756e894b9e81b",
+    "/home/qwopqwop200/Strata-tuning/upstream-027/atomic-agent4-frontend-effort-v2/atomic_regression/__init__.py": "f69552f9eedc4ca1ced6a5207a40d2431d2803b7259901934abc08f0a3bc1f0b",
+    "/home/qwopqwop200/Strata-tuning/upstream-027/atomic-agent1-pack-v1/header-probes/TOKENIZER-KV.json": "47d07d2ab1f5a69bd9e43e731c232c9afa35ed6ab11c9bc32b48f537d453399a",
+    "/home/qwopqwop200/Strata-tuning/upstream-027/atomic-agent1-pack-v1/header-probes/TOKENIZER-SOURCE.json": "9e2a9777785fa6e85cea56742b9d583c429cfb19f88fa190786829554fa47b00",
+    "/home/qwopqwop200/models/AtomicChat-DeepSeek-V4.1-IQ2_XXS/original/chat_template.jinja": "4d61d22c90ea0cdf15c7e298f7215f23eeffd20f8eed8fb517fda5fb64693d99",
+    "/home/qwopqwop200/Strata-tuning/upstream-027/llama-pinned/src/llama-vocab.cpp": "82e8996cbbd81c1648b1f4946b5f481138aa897a1343dcd8b1a4abe8cff0b5fc"
+  },
+  "elapsed_lock_s": 1.5770329153165221,
+  "maxrss_child_kib": 155680,
+  "CUDA_runs": 0,
+  "model_runs": 0,
+  "scope": "Actual API HTTP mocks/Service renderer using Atomic header/original template; no real model"
+}

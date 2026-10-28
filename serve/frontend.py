@@ -138,7 +138,7 @@ EFFORT = {"none": None, "off": None, "minimal": None, "disabled": None, "false":
 # DeepSeek-V4.1's template takes low, medium, high (its default) and max, or a whole number 1..100 (the "Reasoning
 # Effort: N" line of its prompt).  use_family("deepseek41") switches the table; the other families keep the one above.
 EFFORT_DEEPSEEK = {"none": None, "off": None, "minimal": None, "disabled": None, "false": None,
-                   "low": "low", "medium": "medium", "high": "high", "xhigh": "max", "max": "max", "maximum": "max"}
+                   "low": "low", "medium": 62, "high": "high", "xhigh": "max", "max": "max", "maximum": "max"}
 _EFFORT_QWEN = dict(EFFORT)
 _NUMERIC_EFFORT = False
 
@@ -161,6 +161,10 @@ def effort_kwargs(value) -> dict:
         if not 1 <= value <= 100:
             raise ValueError(f"unknown reasoning effort {value!r}: use none, low, medium, high, max or 1..100")
         return {"reasoning_effort": value}
+    # DeepSeek's original template accepts canonical numeric strings as well as ints.
+    # Keep other families' effort parsing unchanged; do not accept signs/leading zeros.
+    if _NUMERIC_EFFORT and isinstance(value, str) and re.fullmatch(r"(?:[1-9][0-9]?|100)", value):
+        return {"reasoning_effort": int(value)}
     key = str(value).strip().lower()
     if key not in EFFORT:
         raise ValueError(f"unknown reasoning effort {value!r}: use none, low, medium or high"
@@ -175,7 +179,7 @@ def budget_effort(tokens) -> dict:
         n = int(tokens)
     except (TypeError, ValueError):
         return {}
-    return {"reasoning_effort": "low" if n < 2048 else "medium" if n < 8192 else EFFORT["high"]}
+    return {"reasoning_effort": EFFORT["low"] if n < 2048 else EFFORT["medium"] if n < 8192 else EFFORT["high"]}
 
 
 def _has_image(content) -> bool:
