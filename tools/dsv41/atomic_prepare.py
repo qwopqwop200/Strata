@@ -59,7 +59,8 @@ def main():
   from pack_gguf import Gguf
   first=next(root/'backbone'/x['filename']for x in m['files']if x['subdir']=='backbone'and'-00001-'in x['filename'])
   tokenizer_kv={k:v for k,v in Gguf(first).kv.items()if k.startswith('tokenizer.')}
-  tokenizer_source=dict(kind='atomic_embedded_gguf',repo='AtomicChat/DeepSeek-V4.1-Flash-1017-Uncensored-GSQ-RCO-GGUF',revision=ATOMIC,source_file=str(first),header_probe=str(REPO/'header-probes'/(first.name+'.header-prefix')),tokenizer_metadata_sha256=hashlib.sha256(json.dumps(tokenizer_kv,sort_keys=True,separators=(',',':')).encode()).hexdigest(),full_files_verified=True,chat_template_override=str(root/'original/chat_template.jinja'),chat_template_sha256=sha(root/'original/chat_template.jinja'))
+  historical_probe=REPO/'header-probes'/(first.name+'.header-prefix')
+  tokenizer_source=dict(kind='atomic_embedded_gguf',repo='AtomicChat/DeepSeek-V4.1-Flash-1017-Uncensored-GSQ-RCO-GGUF',revision=ATOMIC,source_file=str(first),header_probe=str(historical_probe)if historical_probe.is_file()else None,header_probe_role='historical_optional_not_complete_file_verification',source_file_sha256=next(x['sha256']for x in m['files']if x['subdir']=='backbone'and x['filename']==first.name),tokenizer_metadata_sha256=hashlib.sha256(json.dumps(tokenizer_kv,sort_keys=True,separators=(',',':')).encode()).hexdigest(),full_files_verified=True,chat_template_override=str(root/'original/chat_template.jinja'),chat_template_sha256=sha(root/'original/chat_template.jinja'))
   tokenizer_source['export_sha256']={n:sha(out/'tokenizer'/n)for n in ['vocab.json','merges.txt','token_type.json','tokenizer.json','chat_template.jinja']}
   (out/'tokenizer/tokenizer-source.json').write_text(json.dumps(tokenizer_source,indent=2)+'\n')
   if before!={str(p):identity(p)for p in set(inputs)}or source_before!={p:sha(p)for p in source_before}:raise ValueError('immutable input/source stat identity drift')
