@@ -1,0 +1,35 @@
+{
+  "status": "PASS",
+  "command": [
+    "/home/qwopqwop200/Strata-spark/.venv/bin/python",
+    "-B",
+    "-m",
+    "unittest",
+    "atomic_regression.test_frontend_assets",
+    "-v"
+  ],
+  "owned_pid": 2974853,
+  "owned_returncode": 0,
+  "owned_reaped": true,
+  "timeout": false,
+  "source_prepost_equal": true,
+  "source_sha256": {
+    "/home/qwopqwop200/Strata-tuning/upstream-027/atomic-agent4-assets-v3/tools/strata_tokenizer.py": "f47a65e1cdd701513f0a99e445d319d9438728c73042c57eff74ffec1b409a96",
+    "/home/qwopqwop200/Strata-tuning/upstream-027/atomic-agent4-assets-v3/serve/frontend.py": "79ecf295e91e7c2c21aad51bc9bf101a86b0b4c6296b6c9b654e78028e87310e",
+    "/home/qwopqwop200/Strata-tuning/upstream-027/atomic-agent4-assets-v3/serve/dsml.py": "27717ea9099dcdff1f61203d5104c9cab1a3e3b45962edcfa02d5586e723255d",
+    "/home/qwopqwop200/Strata-tuning/upstream-027/atomic-agent4-assets-v3/atomic_regression/render_request.py": "c7612847acb6cdda59ebae465200519c4a1bb4185dd34a31fce5229da49691fc",
+    "/home/qwopqwop200/Strata-tuning/upstream-027/atomic-agent4-assets-v3/atomic_regression/frontend_assets.py": "28d6b06fefeec2acc5e7293695cb0c3fb2b30da71dffacdd8eab35af3f7a4d2a",
+    "/home/qwopqwop200/Strata-tuning/upstream-027/atomic-agent4-assets-v3/atomic_regression/test_frontend_assets.py": "bdaa6e02adfdf6c100da61fe60f09fe08ff9f503b2f70edca9fd095c66d2b221",
+    "/home/qwopqwop200/Strata-tuning/upstream-027/atomic-agent4-assets-v3/atomic_regression/materialize_header_tokenizer.py": "ed424c41341d57618f184426ec688d1c8a4feb33e87608b72053b67a40c8db54",
+    "/home/qwopqwop200/Strata-tuning/upstream-027/atomic-agent4-assets-v3/atomic_regression/__init__.py": "f69552f9eedc4ca1ced6a5207a40d2431d2803b7259901934abc08f0a3bc1f0b",
+    "/home/qwopqwop200/Strata-tuning/upstream-027/atomic-agent1-pack-v1/header-probes/TOKENIZER-KV.json": "47d07d2ab1f5a69bd9e43e731c232c9afa35ed6ab11c9bc32b48f537d453399a",
+    "/home/qwopqwop200/Strata-tuning/upstream-027/atomic-agent1-pack-v1/header-probes/TOKENIZER-SOURCE.json": "9e2a9777785fa6e85cea56742b9d583c429cfb19f88fa190786829554fa47b00",
+    "/home/qwopqwop200/models/AtomicChat-DeepSeek-V4.1-IQ2_XXS/original/chat_template.jinja": "4d61d22c90ea0cdf15c7e298f7215f23eeffd20f8eed8fb517fda5fb64693d99",
+    "/home/qwopqwop200/Strata-tuning/upstream-027/llama-pinned/src/llama-vocab.cpp": "82e8996cbbd81c1648b1f4946b5f481138aa897a1343dcd8b1a4abe8cff0b5fc"
+  },
+  "elapsed_lock_s": 1.1728502912446856,
+  "maxrss_child_kib": 234500,
+  "CUDA_runs": 0,
+  "model_runs": 0,
+  "scope": "Actual Atomic header/ISTA template plus compact/full special ID semantics, CPU only"
+}

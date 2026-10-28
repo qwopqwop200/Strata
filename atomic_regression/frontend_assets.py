@@ -32,7 +32,13 @@ def verify_export(root,metadata):
  if json.loads((root/'token_type.json').read_text())!=types or len(types)!=len(tokens):raise ValueError('token types differ from Atomic header')
  pre=metadata.get('tokenizer.ggml.pre');special={k:int(v) for k,v in metadata.items() if k.startswith('tokenizer.ggml.') and k.endswith('_token_id')}
  if metadata.get('tokenizer.ggml.model')!='gpt2' or not isinstance(pre,str) or not (pre.startswith('deepseek') or pre=='joyai-llm'):raise ValueError('unexpected Atomic tokenizer pre/model')
- if cfg.get('pre')!=pre or cfg.get('vocab_size')!=len(tokens) or cfg.get('special_ids')!=special:raise ValueError('exported tokenizer config differs')
+ compact={name:special['tokenizer.ggml.'+field+'_token_id'] for name,field in [('bos','bos'),('eos','eos'),('pad','padding')]}
+ if cfg.get('pre')!=pre or cfg.get('vocab_size',len(vocab))!=len(tokens) or cfg.get('n_merges',len(merges))!=len(merges) or cfg.get('model','gpt2')!='gpt2':raise ValueError('exported tokenizer config differs')
+ if cfg.get('special_ids') not in (special,compact):raise ValueError('exported special IDs differ from Atomic header')
+ if 'gguf_special_ids' in cfg and cfg['gguf_special_ids']!=special:raise ValueError('explicit original GGUF IDs differ')
+ for name in ['add_bos_token','add_eos_token']:
+  if cfg.get(name) is not metadata['tokenizer.ggml.'+name]:raise ValueError('exported auto-special flag differs '+name)
+ if 'pre_pattern' in cfg and cfg['pre_pattern']!=list(ST.DEEPSEEK3_PATTERNS):raise ValueError('pre pattern metadata differs from JoyAI sequence')
  tok=ST.Tokenizer(tokens,merges,types,pre,special)
  for token in ['<｜begin▁of▁sentence｜>','<｜User｜>','<｜Assistant｜>','<think>','</think>',IMAGE]:
   if token not in tok.ids or len(tok.encode(token,parse_special=True))!=1:raise ValueError('missing/split required special '+token)

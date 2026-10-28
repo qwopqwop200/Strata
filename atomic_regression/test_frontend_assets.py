@@ -39,6 +39,15 @@ class AtomicAssets(unittest.TestCase):
  def test_incomplete_download_rejected(self):
   p=self.d/'incomplete.json';p.write_text('{"stage":"downloading"}');m=self.d/'manifest.json';m.write_text('{"verified":false}')
   with self.assertRaises(ValueError):self.front.assert_download_complete(p,m)
+ def test_actual_compact_config_matches_full_schema(self):
+  p=Path(self.c['tokenizer_root'])/'tokenizer.json';before=p.read_bytes();cfg=json.loads(before)
+  compact={'pre':'joyai-llm','special_ids':{'bos':0,'eos':1,'pad':1},'add_bos_token':False,'add_eos_token':False}
+  try:
+   p.write_text(json.dumps(compact));tok=verify_export(self.c['tokenizer_root'],self.md);self.assertEqual(tok.encode('123456'),self.front.tok.encode('123456'))
+   compact.update(vocab_size=129280,gguf_special_ids=cfg['special_ids']);p.write_text(json.dumps(compact));verify_export(self.c['tokenizer_root'],self.md)
+   compact['special_ids']['pad']=0;p.write_text(json.dumps(compact))
+   with self.assertRaises(ValueError):verify_export(self.c['tokenizer_root'],self.md)
+  finally:p.write_bytes(before)
  def test_no_false_model_ready_from_header(self):
   self.assertFalse(self.c['model_ready']);self.assertFalse(self.c['tokenizer_source']['full_files_verified']);self.assertEqual(self.c['template'],str(TEMPLATE))
 if __name__=='__main__':unittest.main()
