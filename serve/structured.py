@@ -120,7 +120,7 @@ def _only_objects(node, root, refs=()):
     return isinstance(branches, list) and any(_only_objects(b, root, refs) for b in branches)
 
 
-def prepare_format(response_format, messages, with_tools=False):
+def prepare_format(response_format, messages, with_tools=False, require_constraint=False):
     if response_format is None:
         return messages, None
     if not isinstance(response_format, dict):
@@ -139,11 +139,16 @@ def prepare_format(response_format, messages, with_tools=False):
             raise ValueError("response_format.json_schema needs a name")
         if "strict" in spec and not isinstance(spec["strict"], bool):
             raise ValueError("response_format.json_schema.strict must be boolean")
+        if require_constraint and spec.get("strict") is not False:
+            raise ValueError("response_format.json_schema: strict constrained decoding is unsupported by this engine; "
+                             "strict=false explicitly selects prompt-and-validate only, without a generation guarantee")
         schema = spec["schema"]
         if not _only_objects(schema, schema):
             raise ValueError("response_format schema must accept only JSON objects at its root "
                              "(type object, or anyOf/oneOf of object schemas)")
         modules = jsonschema_modules()
+        if require_constraint and modules is None:
+            raise ValueError("response_format.json_schema requires jsonschema; schema validation cannot be downgraded")
     else:
         raise ValueError("response_format.type must be text, json_object or json_schema")
 

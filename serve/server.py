@@ -3948,6 +3948,10 @@ class Service:
         self.engine, self.tok, self.template, self.model, self.vision = engine, tokenizer, template, model_name, vision
         self.literals = literal_tags(getattr(tokenizer, "control_tokens", ()))   # texts that stay text inside a message
         self.fit_max_tokens = fit_max_tokens          # default: clamp the output cap to the room left; False (--no-fit-max-tokens) = 400
+        self.default_max_tokens = 0                   # opt-in nominal budget; zero retains the remaining-context default
+        self.context_slack_tokens = CTX_SLACK         # the DeepSeek GEN protocol permits the full context
+        self.require_strict_schema_constraint = False # opt-in: refuse strict schemas without a native grammar decoder
+        self.report_output_budget = False
         self.aliases: list[str] = []                  # #297: other names of the model (the config's `aliases`)
         self.answer_room = True                       # 0.1.45: see ANSWER_ROOM_MIN_CAP (the config's "answer_room": false turns it off)
         self.reasoning_close_retry = False            # #1053 (opt-in): close the thinking once when a reply ends inside it
@@ -4625,11 +4629,13 @@ class Service:
         """The request with the shared thinking level and max tokens filled in where it has none of its own."""
         s = self.shared
         effort = self.effort_default()
-        if not s and not effort:
+        if not s and not effort and not self.default_max_tokens:
             return req
         req = dict(req)
         if "max_tokens" in s and not req.get("max_tokens") and not req.get("max_completion_tokens"):
             req["max_tokens"] = s["max_tokens"]
+        elif self.default_max_tokens and "max_tokens" not in req and "max_completion_tokens" not in req:
+            req["max_tokens"] = self.default_max_tokens
         if effort:
             if api == "openai":
                 ctk = req.get("chat_template_kwargs") if isinstance(req.get("chat_template_kwargs"), dict) else {}
@@ -4838,7 +4844,14 @@ class Service:
             "service": "strata", "model": self.model,
             "loaded": self.loaded(), "auto_load": hasattr(self.engine, "restart"),
             "structured_output": {"formats": ["json_object", "json_schema"], "method": "prompt_and_validate",
-                                  "constrained_decoding": False, "stream_buffered": True},
+                                  "constrained_decoding": False, "stream_buffered": True,
+                                  **({"strict_json_schema": False, "json_schema_requires_explicit_strict_false": True}
+                                     if self.require_strict_schema_constraint else {})},
+            **({"output_budget": {"default_requested_max_tokens": self.default_max_tokens,
+                                  "total_context_tokens": ctx, "context_slack_tokens": self.context_slack_tokens,
+                                  "policy": "min(requested_max_tokens, total_context_tokens - encoded_input_tokens - context_slack_tokens)",
+                                  "input_truncation": False}}
+               if self.report_output_budget else {}),
             "engine": (getattr(self.engine, "info", {}) or {}).get("version"),
             "started": int(self.started_at), "uptime_s": int(time.time() - self.started_at),
             "cache_max_tokens": ctx,
@@ -5049,7 +5062,7 @@ class Service:
             ctx = getattr(self.engine, "known_ctx", 0)
             if ctx <= 0:
                 raise EngineStarting("the engine is starting (a minute or two); try again shortly")
-        room = ctx - CTX_SLACK - len(ids)
+        room = ctx - self.context_slack_tokens - len(ids)
         if max_new is None or max_new <= 0 or (self.fit_max_tokens and room < 1):
             if room < 1:
                 # A prompt refused for the context is not kept (#567): the client cannot resend it unchanged.  The
@@ -6161,7 +6174,14 @@ def openai_chunks(svc: Service, req: dict, ids, thinking, tools, max_new, cancel
 
     def chunk(delta, finish=None):
         return {"id": cid, "object": "chat.completion.chunk", "created": created, "model": model,
-                "choices": [{"index": 0, "delta": delta, "finish_reason": finish}]}
+                "choices": [{"index": 0, "delta": delta, "finish_reason": finish}],
+                **({"output_budget": {"total_context_tokens": svc.engine.max_context,
+                                       "encoded_input_tokens": len(ids),
+                                       "requested_max_tokens": req.get("max_completion_tokens") or req.get("max_tokens") or 0,
+                                       "effective_max_tokens": max_new,
+                                       "context_slack_tokens": svc.context_slack_tokens,
+                                       "input_truncated": False}}
+                   if svc.report_output_budget else {})}
 
     yield chunk({"role": "assistant", "content": ""})
     lp = LogprobEntries(svc, allowed_ids(req), cancel) if top_logprobs(req) is not None else None
@@ -6270,6 +6290,8 @@ def openai_collect(chunks) -> dict:
             {"reasoning_content": lps["reasoning_content"]} if lps.get("reasoning_content") else {})}
     if last.get("timings"):
         out["timings"] = last["timings"]
+    if last.get("output_budget"):
+        out["output_budget"] = last["output_budget"]
     if last.get("strata_rejected_tool_calls"):
         out["strata_rejected_tool_calls"] = last["strata_rejected_tool_calls"]
     return out
@@ -7597,7 +7619,8 @@ def make_handler(svc: Service):
             if tool_choice_of(req.get("tool_choice"))[0] == "none":   # as the Responses route: no tools are offered
                 tools = None
             force = svc.force_text(forced_call(req.get("tool_choice"), tools))      # a bad value is a 400 before anything is sent
-            messages, validator = prepare_format(req.get("response_format"), messages)
+            messages, validator = prepare_format(req.get("response_format"), messages,
+                                                 require_constraint=svc.require_strict_schema_constraint)
             if validator is not None and (tools or req.get("strata_mcp")):
                 raise ValueError("structured response_format with tools/MCP is not supported")
             svc.load()
@@ -7801,7 +7824,8 @@ def make_handler(svc: Service):
             except ValueError as e:
                 raise ResponsesError(str(e), "input") from None
             try:
-                messages, validator = prepare_format(responses_api.text_format(req), messages, with_tools=bool(tools))
+                messages, validator = prepare_format(responses_api.text_format(req), messages, with_tools=bool(tools),
+                                                     require_constraint=svc.require_strict_schema_constraint)
             except ValueError as e:
                 raise ResponsesError(str(e).replace("response_format", "text.format"), "text.format") from None
             noted = svc.__dict__.setdefault("hosted_tools_noted", set())   # said once per tool, not per request
@@ -7811,6 +7835,8 @@ def make_handler(svc: Service):
                 noted.update(skipped)
             if req.get("max_output_tokens") is None and "max_tokens" in svc.shared:   # the shared Chat settings
                 req = {**req, "max_output_tokens": svc.shared["max_tokens"]}
+            elif req.get("max_output_tokens") is None and svc.default_max_tokens:
+                req = {**req, "max_output_tokens": svc.default_max_tokens}
             try:
                 svc.reasoning_budget(req)                    # a bad value is a 400 before anything is sent
             except ValueError as e:
@@ -9013,6 +9039,15 @@ def main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> in
         svc.requested_slots = per_replica * len(groups) if groups else per_replica
     svc.answer_room = cfg.get("answer_room") is not False
     svc.reasoning_close_retry = cfg.get("reasoning_close_retry") is True    # #1053: opt-in, off by default
+    svc.default_max_tokens = clean_shared_defaults({"max_tokens": cfg["default_max_tokens"]}).get("max_tokens", 0) \
+        if cfg.get("default_max_tokens") is not None else 0
+    svc.require_strict_schema_constraint = cfg.get("require_strict_schema_constraint") is True
+    svc.report_output_budget = cfg.get("report_output_budget") is True
+    if "context_slack_tokens" in cfg:
+        slack = cfg["context_slack_tokens"]
+        if type(slack) is not int or slack < 0 or (slack < CTX_SLACK and svc.family != "deepseek41"):
+            raise SystemExit("[strata] context_slack_tokens must be a non-negative integer; only DeepSeek supports less than 8")
+        svc.context_slack_tokens = slack
     if cfg.get("images"):                               # image generation (serve/images.py), set up by setup --images
         icfg = {k: (os.path.abspath(os.path.join(cfg.get("cwd") or ".", v))
                     if k in ("exe", "diffusion_model", "vae", "llm", "out_dir") and isinstance(v, str)
