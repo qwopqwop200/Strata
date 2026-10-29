@@ -1,6 +1,7 @@
 """Model-free checks for the opt-in production budget and honest schema policy."""
 import json
 import unittest
+import urllib.request
 
 from serve import frontend, structured
 from serve.server import CTX_SLACK, Service, openai_collect
@@ -27,6 +28,9 @@ class Production(ApiBase):
         self.svc.default_max_tokens = 262144
         self.svc.context_slack_tokens = 0
         self.svc.report_output_budget = True
+        with urllib.request.urlopen(self.base + '/props') as response:
+            props = json.load(response)
+        self.assertEqual(props['default_generation_settings']['params']['n_predict'], 262144)
         for stream in (False, True):
             code, reply = self.post('/v1/chat/completions', {
                 'messages': [{'role': 'user', 'content': '1+1?'}], 'stream': stream}, raw=stream)
