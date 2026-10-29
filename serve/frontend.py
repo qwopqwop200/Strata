@@ -70,7 +70,14 @@ class ChatTemplate:
         These are rendering hints, not a guarantee that the model will follow a request."""
         def render(messages, tools=None):
             try:
-                return self.render(messages, tools=tools)
+                text = self.render(messages, tools=tools)
+                if "<｜DSML｜" in text:
+                    # Probe the same call format the DeepSeek output parser accepts. This only changes
+                    # capability discovery; the actual model prompt keeps its native DSML bytes.
+                    from serve.dsml import DsmlTranslator
+                    translator = DsmlTranslator()
+                    text = translator.feed(text) + translator.flush()
+                return text
             except Exception as exc:                # noqa: BLE001 - a hint only: never stop the server for a probe
                 # A template may reject a role or feature (a custom one may fail in any way): the feature is off,
                 # discovery still answers for the others, and the start-up goes on.
