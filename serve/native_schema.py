@@ -13,7 +13,8 @@ ANNOTATIONS={'title','description','$schema','examples','default'}
 KEYS=ANNOTATIONS|{'type','properties','required','additionalProperties','items','minItems','maxItems','enum','const'}
 
 class Compiler:
-    def __init__(self):
+    def __init__(self, dsml=False):
+        self.dsml=dsml
         self.rules=[]
         # Bound formatting whitespace so a conflicting prompt cannot avoid the required JSON forever.
         white=self.new([[self.rng(9,10)],[13],[32]])
@@ -29,7 +30,9 @@ class Compiler:
         self.number=self.new([[sign,self.integer,fraction,exponent,self.ws]])
         tail=self.rng(128,191)
         esc=self.new([[x] for x in b'"\\/bfnrt']+[[117,self.hex,self.hex,self.hex,self.hex]])
-        char=self.new([[self.rng(32,33)],[self.rng(35,91)],[self.rng(93,127)],[92,esc],
+        ascii_chars=[[self.rng(32,33)],[self.rng(35,91)],[self.rng(93,127)]]
+        if dsml:ascii_chars=[[self.rng(32,33)],[self.rng(35,59)],[self.rng(61,91)],[self.rng(93,127)]]
+        char=self.new(ascii_chars+[[92,esc],
                        [self.rng(194,223),tail],[224,self.rng(160,191),tail],
                        [self.rng(225,236),tail,tail],[237,self.rng(128,159),tail],
                        [self.rng(238,239),tail,tail],[240,self.rng(144,191),tail,tail],
@@ -55,7 +58,9 @@ class Compiler:
         r=256+len(self.rules);self.rules.append(alts or []);return r
     def set(self,r,alts):self.rules[r-256]=alts
     def literal(self,value):
-        return list(json.dumps(value,ensure_ascii=False,allow_nan=False,separators=(',',':')).encode())+[self.ws]
+        text=json.dumps(value,ensure_ascii=False,allow_nan=False,separators=(',',':'))
+        if self.dsml:text=text.replace('<','\\u003c')
+        return list(text.encode())+[self.ws]
 
     def value(self,s,depth=0):
         if depth>64:raise ValueError('unsupported schema nesting beyond 64')
@@ -95,7 +100,9 @@ class Compiler:
                 r=self.new();cache[i,previous]=r
                 if i==len(entries):self.set(r,[[]]);return r
                 k,v=entries[i]
-                key=list(json.dumps(k,ensure_ascii=False).encode())
+                text=json.dumps(k,ensure_ascii=False)
+                if self.dsml:text=text.replace('<','\\u003c')
+                key=list(text.encode())
                 take=([44,self.ws] if previous else [])+key+[self.ws,58,self.ws,v,fields(i+1,True)]
                 self.set(r,[take]+([] if k in required else [[fields(i+1,previous)]]));return r
             return self.new([[123,self.ws,fields(0,False),125,self.ws]])
@@ -119,17 +126,18 @@ def compile_schema(schema):
     c=Compiler();root=c.new([[c.ws,c.value(schema)]])
     return {'rules':c.rules,'root':root}
 
-def write_bundle(path,grammar,tokens,eos,think_end,thinking):
+def write_bundle(path,grammar,tokens,eos,think_end,thinking,*,tool_prefix=None):
     """Length-prefixed bytes preserve split UTF-8 tokens; None bans control/special tokens in the answer."""
     with Path(path).open('wb') as f:
         def ints(*v):f.write(struct.pack('<'+'i'*len(v),*v))
-        f.write(b'SGR1');ints(len(tokens),eos,think_end,int(bool(thinking)),len(grammar['rules']),grammar['root'])
+        f.write(b'SGR1' if tool_prefix is None else b'SGT1');ints(len(tokens),eos,think_end,int(bool(thinking)),len(grammar['rules']),grammar['root'])
         for token in tokens:
             ints(-1 if token is None else len(token))
             if token is not None:f.write(token)
         for rule in grammar['rules']:
             ints(len(rule))
             for seq in rule:ints(len(seq));ints(*seq)
+        if tool_prefix is not None:ints(len(tool_prefix));ints(*tool_prefix)
 
 _cache=tempfile.TemporaryDirectory(prefix='strata-native-grammar-')
 _vocab={}

@@ -1013,6 +1013,7 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
         //  the checkpoint at this prompt's end)
         stat_line();
         const double t2 = now_ms();
+        m.report_grammar();
         std::printf("DONE %lld %zu %.1f %.1f %s %lld %lld %zu 0 0\n", produced, r.ids.size(), t1 - t0, t2 - t1, finish,
                     d_acc, d_off, from);
         std::fflush(stdout);

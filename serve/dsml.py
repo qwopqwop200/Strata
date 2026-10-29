@@ -168,6 +168,7 @@ class DsmlOutputParser(OutputParser):
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
+        self.native_constraints = False
         self.dsml = DsmlTranslator(self._on_param)
         # The 2-bit sets often write the whole answer after <think> and stop (EOS) without </think>: everything would be reasoning and
         # the reply empty (P2003 install test, 4 of 4 prompts).  The reasoning text is kept here; finish() hands it over as the answer
@@ -185,21 +186,29 @@ class DsmlOutputParser(OutputParser):
 
     def _on_param(self, tool, name, is_string) -> None:
         """string="true": the value is a string whatever it looks like ("123", "true"), as the template wrote it."""
-        if not is_string:
+        if not is_string and not self.native_constraints:
             return
         spec = self.schemas.get(tool)
         if spec is None:
             return
         params = dict(spec.get("parameters") or {})
         props = dict(params.get("properties") or {})
-        if (props.get(name) or {}).get("type") != "string":
-            props[name] = {**(props.get(name) or {}), "type": "string"}
+        typ = "string" if is_string else None
+        if (props.get(name) or {}).get("type") != typ:
+            props[name] = {**(props.get(name) or {}), "type": typ}
             params["properties"] = props
             self.schemas[tool] = {**spec, "parameters": params}
         if self.scall is not None and self.scall.name == tool:
-            self.sdeclared[name] = "string"
+            self.sdeclared[name] = typ
 
     def feed(self, delta: str):
+        if self.native_constraints:
+            # Apply each explicit string flag before its parameter is consumed.
+            # A single detokenizer chunk can contain several complete tags/calls.
+            out = []
+            for piece in re.findall(r'[^>]*>|[^>]+$', delta):
+                out += self._watch(super().feed(self.dsml.feed(piece)))
+            return out
         return self._watch(super().feed(self.dsml.feed(delta)))
 
     def finish(self, reason: str | None = None):

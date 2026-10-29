@@ -125,6 +125,7 @@ public:
     int sample(float temperature, float top_p, int top_k, float min_p, uint64_t seed, uint64_t counter);
     /// The last feed's logit rows on the host (rows x vocab floats).
     bool logits(std::vector<float>& out);
+    void report_grammar() const;
     void set_grammar(std::shared_ptr<Grammar> grammar);
 
     /// The DSpark drafter (speculative decoding): its block size (0: not loaded), drafts for the positions after `y`

@@ -263,7 +263,8 @@ def request_tools(req: dict):
                 description += f"\n\nThe input must follow this {fmt.get('syntax', '')} grammar:\n{fmt['definition']}"
             params = {"type": "object", "properties": {"input": {"type": "string", "description": "the raw input"}},
                       "required": ["input"]}
-        tools.append({"name": flat, "description": description, "parameters": params})
+        tools.append({"name": flat, "description": description, "parameters": params,
+                      **({"strict":tool["strict"]} if "strict" in tool else {})})
         names[flat] = (namespace, name, kind)
 
     for i, tool in enumerate(given):

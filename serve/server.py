@@ -82,7 +82,7 @@ from serve import owner_guard  # noqa: E402
 from serve import launch_identity  # noqa: E402
 from serve import logit_bias as bias_api  # noqa: E402
 from serve import lifeline  # noqa: E402
-from serve import native_schema
+from serve import native_schema, native_tools
 from serve.structured import StructuredOutputError, prepare_format, validated_json, extract_json  # noqa: E402
 from serve import responses as responses_api  # noqa: E402
 from serve.responses import ResponsesError, error_body as responses_error_body  # noqa: E402
@@ -4860,6 +4860,9 @@ class Service:
                                   "policy": "min(requested_max_tokens, total_context_tokens - encoded_input_tokens - context_slack_tokens)",
                                   "input_truncation": False}}
                if self.report_output_budget else {}),
+            **({"tool_argument_constraints": {"method":"native_token_mask", "explicit_strict_true":True,
+                  "protocol":"DSML", "structured_response_with_tools":False}}
+               if (getattr(self.engine,"info",{}) or {}).get("strict_tool_constraint")==1 else {}),
             "engine": (getattr(self.engine, "info", {}) or {}).get("version"),
             "started": int(self.started_at), "uptime_s": int(time.time() - self.started_at),
             "cache_max_tokens": ctx,
@@ -5296,8 +5299,10 @@ class Service:
                 print(f"[strata] thinking capped at {max_new - reserve} of max_tokens {max_new} to leave room for "
                       f"the answer (budget {budget})", flush=True)
                 budget = max(1, max_new - reserve)
-        parser = self.parser_cls(thinking=thinking, tools=tools, stream_tools=True, recover=self.tool_call_recovery,
+        parser = self.parser_cls(thinking=thinking, tools=tools, stream_tools=True, recover=self.tool_call_recovery and not (sampling or {}).get("_native_tools"),
                                  declared_only=declared_only)
+        if (sampling or {}).get("_native_tools"):
+            parser.native_constraints = True
         detok, n, finish = Detokenizer(self.tok), 0, "length"
         run_tok, run_len, repeated = None, 0, False     # #606: the current run of one repeated token
         thinking_n = 0                                  # tokens written while thinking (Responses' reasoning_tokens)
@@ -5322,6 +5327,7 @@ class Service:
                     out.append(Event("content", held))
                 out.append(ev)
             return out
+        tool_prefix = self.tok.encode(force, parse_special=True) if force and not thinking else []
         opening = []                                    # without thinking the prompt ends with the forced opening:
         if force and not thinking:                      # the parser reads it as if the model had written it
             opening, force = parser.feed(force), None
@@ -5443,8 +5449,9 @@ class Service:
                     while True:
                         segment_before = getattr(self.engine, "last", None)
                         segments_before = len(segments)     # (#879: a pass sent again leaves no segment)
-                        gen = self.engine.generate(prompt, max_new - n, sampling, cancel, embeddings=emb) if emb \
-                            else self.engine.generate(prompt, max_new - n, sampling, cancel)
+                        segment_sampling = native_tools.bind_segment(sampling or {}, self.tok, tool_prefix + raw_ids)
+                        gen = self.engine.generate(prompt, max_new - n, segment_sampling, cancel, embeddings=emb) if emb \
+                            else self.engine.generate(prompt, max_new - n, segment_sampling, cancel)
                         recover_prompt = None
                         seg, wrap, leaving = [], False, False   # this pass's tokens; the budget is reached; closed
                         nonfinite = False               # #879: the engine ended this pass on non-finite logits
@@ -5558,6 +5565,7 @@ class Service:
                                 self._say_died(e)
                                 if not leaving and not cancel.is_set():
                                     raise
+                            native_tools.release_segment(segment_sampling)
                             segment_done = getattr(self.engine, "last", None)
                             if segment_done is not None and segment_done is not segment_before:
                                 segments.append(dict(segment_done))
@@ -7673,6 +7681,7 @@ def make_handler(svc: Service):
             cancel = threading.Event()
             self._watch_client(cancel)                       # #430 #431 (#1999: before prepare, which can take long)
             ids, thinking, max_new = svc.prepare(messages, tools, kw, max_new, force=force, req=req, cancel=cancel)
+            native_tools.prepare(req,tools,svc)
             native_schema.bind_request(req,validator,svc.tok,thinking)
             _debug_req("openai", req, messages, tools, max_new, thinking, len(ids))
             run = run_with_mcp(svc, svc.mcp, messages, tools, kw, ids, thinking, max_new, max_req, req, cancel,
@@ -7881,6 +7890,7 @@ def make_handler(svc: Service):
                     from None
             if svc.codex_compaction_cache:
                 responses_api.prompt_made(req, shown)
+            native_tools.prepare(req,tools,svc)
             native_schema.bind_request(req,validator,svc.tok,thinking)
             _debug_req("responses", req, messages, tools, max_new, thinking, len(ids))
             include = req.get("include") if isinstance(req.get("include"), list) else []
@@ -7913,6 +7923,8 @@ def make_handler(svc: Service):
             cancel = threading.Event()
             self._watch_client(cancel)                       # #430 #431 (#1999: before prepare, which can take long)
             ids, thinking, max_new = svc.prepare(messages, tools, kw, max_new, force=force, req=req, cancel=cancel)
+            req.pop("_native_grammar",None)
+            native_tools.prepare(req,tools,svc)
             _debug_req("anthropic", req, messages, tools, max_new, thinking, len(ids))
             events = anthropic_events(svc, req, ids, thinking, tools, max_new, cancel, force=force)
             events = self._capture(events, "anthropic")
