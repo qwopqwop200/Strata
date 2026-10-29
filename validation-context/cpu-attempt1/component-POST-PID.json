@@ -1,0 +1,9 @@
+{
+  "owned_pid": 2917654,
+  "owned_returncode": 0,
+  "owned_reaped": true,
+  "timed_out": false,
+  "residual_live_initial": [],
+  "residual_live_after": [],
+  "residual_zombies_not_owned": []
+}

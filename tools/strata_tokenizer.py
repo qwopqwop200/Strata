@@ -119,7 +119,7 @@ class Tokenizer:
             if parts[0] not in self.ids or parts[1] not in self.ids:
                 raise ValueError("merge %d names a token outside the vocabulary: %r" % (i, m))
             self.ranks[(parts[0], parts[1])] = i
-        if str(pre).startswith("deepseek"):
+        if str(pre).startswith("deepseek") or pre in ("joyai-llm", "hunyuan-dense", "hy_v4"):
             seq = [regex.compile(x) for x in DEEPSEEK3_PATTERNS]
             self._split = lambda text: _sequence_findall(seq, text)
         else:
@@ -478,8 +478,10 @@ def extract(gguf_path, out_dir) -> dict:
         "add_bos_token": False,
         # The pattern is SHIPPED, not recomputed by the reader: it is transcribed from llama.cpp for the
         # declared `pre` type, and a C++ port that re-derived it would be free to get `\p{M}` wrong again.
-        "pre_pattern": QWEN35_PATTERN,
-        "pre_pattern_source": ".ref/llama.cpp src/llama-vocab.cpp L396 (LLAMA_VOCAB_PRE_TYPE_QWEN35)",
+        "pre_pattern": list(DEEPSEEK3_PATTERNS) if str(tk.pre).startswith("deepseek") or tk.pre in ("joyai-llm", "hunyuan-dense", "hy_v4") else QWEN35_PATTERN,
+        "pre_pattern_source": ("llama.cpp src/llama-vocab.cpp shared DEEPSEEK3/JOYAI/HUNYUAN_DENSE/HY_V4 sequence"
+                               if str(tk.pre).startswith("deepseek") or tk.pre in ("joyai-llm", "hunyuan-dense", "hy_v4")
+                               else ".ref/llama.cpp src/llama-vocab.cpp L396 (LLAMA_VOCAB_PRE_TYPE_QWEN35)"),
     }
     (out / "vocab.json").write_text(json.dumps(tk.ids, ensure_ascii=False), encoding="utf-8")
     (out / "merges.txt").write_text("\n".join("%s %s" % k for k, _ in

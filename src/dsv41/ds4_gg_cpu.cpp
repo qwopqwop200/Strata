@@ -150,6 +150,7 @@ static bool own_ok(int type, int impl) {
 // the AMD family (0x19 Zen 3/4, 0x1A Zen 5), 0 on any other vendor or if it cannot be read
 static int amd_family() {
     static const int fam = [] {
+#if defined(_M_X64) || defined(__x86_64__)
 #if defined(_MSC_VER)
         int r[4];
         __cpuid(r, 0);
@@ -168,11 +169,12 @@ static int amd_family() {
         if (std::strcmp(v, "AuthenticAMD") != 0) return 0;
         if (!__get_cpuid(1, &a, &b, &c, &d)) return 0;
         const unsigned eax = a;
-#else
-        const unsigned eax = 0;   // (not an x86 host: no family)
 #endif
         const unsigned base = (eax >> 8) & 0xF;
         return (int) (base == 0xF ? base + ((eax >> 20) & 0xFF) : base);
+#else
+        return 0;
+#endif
     }();
     return fam;
 }

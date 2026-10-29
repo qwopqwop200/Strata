@@ -1,0 +1,10 @@
+[
+  {
+    "name": "layers.0.ffn.gate.weight",
+    "path": "/home/qwopqwop200/models/Abiray-DeepSeek-V4.1-IQ2_XXS/DeepSeek-V4.1-Flash-1017-GSQ-RCO-IQ2_XXS-00004-of-00004.gguf",
+    "offset": 14919322496,
+    "bytes": 3932160,
+    "n": 384,
+    "k": 5120
+  }
+]

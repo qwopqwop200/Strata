@@ -1,0 +1,11 @@
+{
+  "status": "READY_PARENT_CPU_QUEUE_ONLY",
+  "compile": ["g++", "-std=c++17", "-O2", "-Wall", "-Wextra", "-Werror", "-Isrc/dsv41", "validation-context/test_capacity.cpp", "-o", "validation-context/CPU-component"],
+  "run": ["validation-context/CPU-component"],
+  "python_tests": ["python3", "validation-context/test_contract.py"],
+  "commonlock": "/home/qwopqwop200/Strata-tuning/.validation.lock",
+  "STOP": "/home/qwopqwop200/Strata-tuning/upstream-027/STOP",
+  "model_GPU_CUDA_runs": 0,
+  "capacity_PASS": false,
+  "budget": "one CPU compile+one CPU executable+three synthetic Python tests; <64MiB controlled host memory /30s; no model files written"
+}

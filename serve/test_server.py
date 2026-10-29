@@ -4685,17 +4685,17 @@ class ForcedToolChoice(unittest.TestCase):
         finish, calls, _ = self.call_of(code, b, False)
         self.assertEqual((finish, calls), ("length", []))
 
-    def test_values_it_cannot_honour_act_as_auto(self):
-        """Not a 400: an odd tool_choice is logged and the model decides."""
+    def test_values_it_cannot_honour_are_rejected(self):
+        """A client must be told its choice cannot be honored before generation."""
         named = lambda n: {"type": "function", "function": {"name": n}}  # noqa: E731
         for choice, tools in ((named("nope"), self.TOOLS), ({"type": "function"}, self.TOOLS),
                               ("required", None), ({"type": "banana"}, self.TOOLS), ("sometimes", self.TOOLS)):
             with self.subTest(choice=choice, tools=bool(tools)):
                 self.engine.prompts = []
                 code, b = self.openai(tool_choice=choice, tools=tools)
-                self.assertEqual(code, 200, b)
-                self.assertEqual(b["choices"][0]["message"]["content"], CallingEngine.ANSWER)
-                self.assertEqual(len(self.engine.prompts), 1)
+                self.assertEqual(code, 400, b)
+                self.assertIn("tool_choice", b["error"]["message"])
+                self.assertEqual(self.engine.prompts, [])
 
     def test_the_flat_shape_names_a_function(self):
         code, b = self.openai(tool_choice={"type": "function", "name": "search"})
@@ -4707,8 +4707,7 @@ class ForcedToolChoice(unittest.TestCase):
             "type": "object", "properties": {"q": {"type": "string"}}}}, {"name": "done", "input_schema": {
                 "type": "object", "properties": {}}}]
         for choice, want in (({"type": "any"}, "tool_use"), ({"type": "tool", "name": "search"}, "tool_use"),
-                             ({"type": "auto"}, "end_turn"), ({"type": "none"}, "end_turn"),
-                             ({"type": "tool", "name": "nope"}, "end_turn")):
+                             ({"type": "auto"}, "end_turn"), ({"type": "none"}, "end_turn")):
             for stream in (False, True):
                 with self.subTest(choice=choice, stream=stream):
                     self.engine.prompts = []

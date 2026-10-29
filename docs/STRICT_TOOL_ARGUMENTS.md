@@ -1,0 +1,13 @@
+# Strict tool arguments in the native DeepSeek engine
+
+Set `tools[].function.strict` to `true` to constrain that function's arguments while tokens are sampled. The server refuses an unsupported schema or engine with HTTP 400 before generation. Omitting `strict`, or setting it to `false`, keeps ordinary tool arguments.
+
+Chat Completions supports `auto`, `none`, `required`, and a declared named function. Responses keeps its existing `auto` and `none` support. Required or named Responses choices return 400. A mixed list applies schema constraints only to strict functions. Each call selects its own schema. Streaming keeps the same call IDs and argument deltas as ordinary calls. A truncated call is not a completed tool call.
+
+The strict root must be an object with `additionalProperties: false`. Properties are generated in declaration order. Optional properties may be omitted. Nested values support closed objects, arrays, strings, integers, numbers, booleans, null, type unions, `enum`, and `const`. Arrays support `minItems` and `maxItems` up to 256. The ordinary open JSON object without named properties is also supported as a nested value. Titles, descriptions, examples, defaults, and `$schema` are annotations. Other semantic keywords, including `$ref`, `oneOf`, `pattern`, and numeric bounds, return 400. Root object enum/const is not supported.
+
+Function names use ASCII letters, digits, `_`, `-`, and `.` (up to 128 characters). Root parameter names additionally support Korean Hangul syllables. A raw DSML string enum containing `<` is rejected because it can contain protocol tags. Nested JSON strings can encode `<` as `\u003c`. Generated free strings use a safe subset without a literal `<`. UTF-8 Korean, JSON escapes, quotes, backslashes, and line breaks are supported.
+
+Thinking and final prose remain ordinary text. DSML call markers enter a native grammar for the declared function names, parameters, values, and closing tags. The grammar ends at the closing calls tag. It is replayed from this response's generated and forced tokens for each native continuation; it is never restored from the prompt's KV cache. The existing sampler applies its mask before normalization, including speculative target verification and residual draws. Sampled drafts use a copied grammar. Deterministic drafts can propose an illegal token, which the masked target rejects.
+
+Strict tool arguments and structured final answers are separate features. Combining tools with a structured `response_format` is currently refused with 400. MCP with strict tools is also refused. No post-generation repair or schema retry supplies the strict guarantee. Clients should still validate tool names, parse and validate arguments, and allowlist actual execution.

@@ -1,0 +1,7 @@
+{
+  "source": "/home/qwopqwop200/Strata-tuning/upstream-027/criticalpath-IQ1M-decode-v1/validation-iq1m-swizzle/run_gpu.py",
+  "source_sha256": "deb3892cb39e8b01bf89dfb83b96fd7ea2241454c05333081e9ed0f8fa511452",
+  "exact_transform": "only env name, one dispatch marker instead of2, final PASS text",
+  "existing_lifecycle_tests_reused": "IQ runner CPU5 and actual source/payload/reap PASS; this new component has not executed",
+  "no_new_lifecycle_guarantees": true
+}

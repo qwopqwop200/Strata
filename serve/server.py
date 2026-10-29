@@ -82,6 +82,7 @@ from serve import owner_guard  # noqa: E402
 from serve import launch_identity  # noqa: E402
 from serve import logit_bias as bias_api  # noqa: E402
 from serve import lifeline  # noqa: E402
+from serve import native_schema, native_tools
 from serve.structured import StructuredOutputError, prepare_format, validated_json, extract_json  # noqa: E402
 from serve import responses as responses_api  # noqa: E402
 from serve.responses import ResponsesError, error_body as responses_error_body  # noqa: E402
@@ -1396,7 +1397,7 @@ class StrataEngine:
     def sampling_keys(sampling: dict) -> str:
         keys = ""
         t = sampling.get("temperature")
-        if isinstance(t, (int, float)) and float(t) > 0.0:
+        if isinstance(t, (int, float)) and (float(t) > 0.0 or sampling.get("_native_full_vocab")):
             keys += f" temperature={float(t)!r}"
         tp = sampling.get("top_p")
         if isinstance(tp, (int, float)) and float(tp) < 1.0:
@@ -1404,7 +1405,7 @@ class StrataEngine:
         tk = sampling.get("top_k")
         if isinstance(tk, int) and not isinstance(tk, bool) and tk >= 0:
             # the engine's sampled path keeps at most 64 candidates: 0 ("off") and wider lists get all 64
-            keys += f" top_k={tk if 1 <= tk <= 64 else 64}"
+            keys += f" top_k={tk if sampling.get("_native_full_vocab") else (tk if 1 <= tk <= 64 else 64)}"
         mp = sampling.get("min_p")
         if isinstance(mp, (int, float)) and 0.0 < float(mp) <= 1.0:
             keys += f" min_p={float(mp)!r}"
@@ -1472,6 +1473,10 @@ class StrataEngine:
             if ids:
                 # only these ids are printed; the engine's comma-separated list, renormalised below
                 keys += " allowed=" + ",".join(str(i) for i in ids)
+        if sampling.get("_native_full_vocab") and sampling.get("_native_grammar"):
+            path=sampling["_native_grammar"]
+            if not isinstance(path,str) or any(c.isspace() for c in path):raise ValueError("invalid native grammar path")
+            keys += " grammar="+path
         return keys + StrataEngine.projection_key(sampling) + bias_api.engine_key(sampling.get("logit_bias"))
 
     @staticmethod
@@ -2234,6 +2239,7 @@ class StrataEngine:
         has gone.  A consumer that stops early (or `cancel`) makes the engine STOP, so it does not run to max_new."""
         if not self.alive():
             raise EngineDied("the engine is unavailable; this request was not sent")
+        sampling={**(sampling or {}),"_native_full_vocab":self.info.get("full_vocab_sampling")==1}
         bias_api.validate_request(sampling or {}, self, None)
         if getattr(self, "batch", 0):
             yield from self.generate_batched(ids, max_new, sampling, cancel, embeddings)
@@ -3948,6 +3954,10 @@ class Service:
         self.engine, self.tok, self.template, self.model, self.vision = engine, tokenizer, template, model_name, vision
         self.literals = literal_tags(getattr(tokenizer, "control_tokens", ()))   # texts that stay text inside a message
         self.fit_max_tokens = fit_max_tokens          # default: clamp the output cap to the room left; False (--no-fit-max-tokens) = 400
+        self.default_max_tokens = 0                   # opt-in nominal budget; zero retains the remaining-context default
+        self.context_slack_tokens = CTX_SLACK         # the DeepSeek GEN protocol permits the full context
+        self.require_strict_schema_constraint = False # opt-in: refuse strict schemas without a native grammar decoder
+        self.report_output_budget = False
         self.aliases: list[str] = []                  # #297: other names of the model (the config's `aliases`)
         self.answer_room = True                       # 0.1.45: see ANSWER_ROOM_MIN_CAP (the config's "answer_room": false turns it off)
         self.reasoning_close_retry = False            # #1053 (opt-in): close the thinking once when a reply ends inside it
@@ -4605,7 +4615,7 @@ class Service:
 
     def set_shared(self, defaults) -> dict:
         """The Chat settings every client gets for what it leaves out; {} / None = clients use their own again."""
-        self.shared = clean_shared_defaults(defaults)
+        self.shared = clean_shared_defaults(defaults, family=self.family)
         if self.shared_path:
             try:
                 if self.shared:
@@ -4616,7 +4626,7 @@ class Service:
                 print(f"[strata] could not save the shared settings: {e}", flush=True)
         return self.shared
 
-    def effort_default(self) -> str | None:
+    def effort_default(self) -> str | int | None:
         """The thinking level of a request that names none: the Chat settings shared with apps first, then the config's
         "reasoning_effort" (#1641).  Every API reads it here (the Responses API did not: 0.1.44.1)."""
         return self.shared.get("reasoning_effort") or self.config_effort
@@ -4625,11 +4635,13 @@ class Service:
         """The request with the shared thinking level and max tokens filled in where it has none of its own."""
         s = self.shared
         effort = self.effort_default()
-        if not s and not effort:
+        if not s and not effort and not self.default_max_tokens:
             return req
         req = dict(req)
         if "max_tokens" in s and not req.get("max_tokens") and not req.get("max_completion_tokens"):
             req["max_tokens"] = s["max_tokens"]
+        elif self.default_max_tokens and "max_tokens" not in req and "max_completion_tokens" not in req:
+            req["max_tokens"] = self.default_max_tokens
         if effort:
             if api == "openai":
                 ctk = req.get("chat_template_kwargs") if isinstance(req.get("chat_template_kwargs"), dict) else {}
@@ -4833,12 +4845,24 @@ class Service:
             return round(v / unit, digits) if isinstance(v, (int, float)) else None
 
         busy, ctx = bool(s.get("busy")), self.reported_ctx()
+        constrained = (getattr(self.engine, "info", {}) or {}).get("json_schema_constraint") == 1
         images = self.vision is not None
         return {
             "service": "strata", "model": self.model,
             "loaded": self.loaded(), "auto_load": hasattr(self.engine, "restart"),
-            "structured_output": {"formats": ["json_object", "json_schema"], "method": "prompt_and_validate",
-                                  "constrained_decoding": False, "stream_buffered": True},
+            "structured_output": {"formats": ["json_object", "json_schema"], "method": "native_token_mask" if constrained else "prompt_and_validate",
+                                  "constrained_decoding": constrained, "stream_buffered": True,
+                                  **({"strict_json_schema": constrained,
+                                      "json_schema_requires_explicit_strict_false": not constrained}
+                                     if self.require_strict_schema_constraint else {})},
+            **({"output_budget": {"default_requested_max_tokens": self.default_max_tokens,
+                                  "total_context_tokens": ctx, "context_slack_tokens": self.context_slack_tokens,
+                                  "policy": "min(requested_max_tokens, total_context_tokens - encoded_input_tokens - context_slack_tokens)",
+                                  "input_truncation": False}}
+               if self.report_output_budget else {}),
+            **({"tool_argument_constraints": {"method":"native_token_mask", "explicit_strict_true":True,
+                  "protocol":"DSML", "structured_response_with_tools":False}}
+               if (getattr(self.engine,"info",{}) or {}).get("strict_tool_constraint")==1 else {}),
             "engine": (getattr(self.engine, "info", {}) or {}).get("version"),
             "started": int(self.started_at), "uptime_s": int(time.time() - self.started_at),
             "cache_max_tokens": ctx,
@@ -5049,7 +5073,7 @@ class Service:
             ctx = getattr(self.engine, "known_ctx", 0)
             if ctx <= 0:
                 raise EngineStarting("the engine is starting (a minute or two); try again shortly")
-        room = ctx - CTX_SLACK - len(ids)
+        room = ctx - self.context_slack_tokens - len(ids)
         if max_new is None or max_new <= 0 or (self.fit_max_tokens and room < 1):
             if room < 1:
                 # A prompt refused for the context is not kept (#567): the client cannot resend it unchanged.  The
@@ -5275,8 +5299,10 @@ class Service:
                 print(f"[strata] thinking capped at {max_new - reserve} of max_tokens {max_new} to leave room for "
                       f"the answer (budget {budget})", flush=True)
                 budget = max(1, max_new - reserve)
-        parser = self.parser_cls(thinking=thinking, tools=tools, stream_tools=True, recover=self.tool_call_recovery,
+        parser = self.parser_cls(thinking=thinking, tools=tools, stream_tools=True, recover=self.tool_call_recovery and not (sampling or {}).get("_native_tools"),
                                  declared_only=declared_only)
+        if (sampling or {}).get("_native_tools"):
+            parser.native_constraints = True
         detok, n, finish = Detokenizer(self.tok), 0, "length"
         run_tok, run_len, repeated = None, 0, False     # #606: the current run of one repeated token
         thinking_n = 0                                  # tokens written while thinking (Responses' reasoning_tokens)
@@ -5301,6 +5327,7 @@ class Service:
                     out.append(Event("content", held))
                 out.append(ev)
             return out
+        tool_prefix = self.tok.encode(force, parse_special=True) if force and not thinking else []
         opening = []                                    # without thinking the prompt ends with the forced opening:
         if force and not thinking:                      # the parser reads it as if the model had written it
             opening, force = parser.feed(force), None
@@ -5422,8 +5449,9 @@ class Service:
                     while True:
                         segment_before = getattr(self.engine, "last", None)
                         segments_before = len(segments)     # (#879: a pass sent again leaves no segment)
-                        gen = self.engine.generate(prompt, max_new - n, sampling, cancel, embeddings=emb) if emb \
-                            else self.engine.generate(prompt, max_new - n, sampling, cancel)
+                        segment_sampling = native_tools.bind_segment(sampling or {}, self.tok, tool_prefix + raw_ids)
+                        gen = self.engine.generate(prompt, max_new - n, segment_sampling, cancel, embeddings=emb) if emb \
+                            else self.engine.generate(prompt, max_new - n, segment_sampling, cancel)
                         recover_prompt = None
                         seg, wrap, leaving = [], False, False   # this pass's tokens; the budget is reached; closed
                         nonfinite = False               # #879: the engine ended this pass on non-finite logits
@@ -5537,6 +5565,7 @@ class Service:
                                 self._say_died(e)
                                 if not leaving and not cancel.is_set():
                                     raise
+                            native_tools.release_segment(segment_sampling)
                             segment_done = getattr(self.engine, "last", None)
                             if segment_done is not None and segment_done is not segment_before:
                                 segments.append(dict(segment_done))
@@ -6161,7 +6190,14 @@ def openai_chunks(svc: Service, req: dict, ids, thinking, tools, max_new, cancel
 
     def chunk(delta, finish=None):
         return {"id": cid, "object": "chat.completion.chunk", "created": created, "model": model,
-                "choices": [{"index": 0, "delta": delta, "finish_reason": finish}]}
+                "choices": [{"index": 0, "delta": delta, "finish_reason": finish}],
+                **({"output_budget": {"total_context_tokens": svc.engine.max_context,
+                                       "encoded_input_tokens": len(ids),
+                                       "requested_max_tokens": req.get("max_completion_tokens") or req.get("max_tokens") or 0,
+                                       "effective_max_tokens": max_new,
+                                       "context_slack_tokens": svc.context_slack_tokens,
+                                       "input_truncated": False}}
+                   if svc.report_output_budget else {})}
 
     yield chunk({"role": "assistant", "content": ""})
     lp = LogprobEntries(svc, allowed_ids(req), cancel) if top_logprobs(req) is not None else None
@@ -6270,6 +6306,8 @@ def openai_collect(chunks) -> dict:
             {"reasoning_content": lps["reasoning_content"]} if lps.get("reasoning_content") else {})}
     if last.get("timings"):
         out["timings"] = last["timings"]
+    if last.get("output_budget"):
+        out["output_budget"] = last["output_budget"]
     if last.get("strata_rejected_tool_calls"):
         out["strata_rejected_tool_calls"] = last["strata_rejected_tool_calls"]
     return out
@@ -6355,6 +6393,10 @@ def structured_chunks(chunks, validator):
                 yield chunk if progress else None
         result = openai_collect(buffered)
         choice = result["choices"][0]
+        if getattr(validator,"native",False):
+            native_schema.validated_raw(choice["message"]["content"],validator,choice["finish_reason"])
+            yield from buffered
+            return
         content = validated_json(choice["message"]["content"], validator, choice["finish_reason"])
         # logprobs: the entries spell what the model wrote, which this function replaces with the
         # canonical JSON.  `_structured_logprobs` gives back the form the tokens spell, or None.
@@ -7092,6 +7134,7 @@ def make_handler(svc: Service):
                 self._json(200, {"status": "ok", "max_context": svc.reported_ctx(), "model": svc.model,
                                  "images": svc.vision is not None, "api_key": bool(svc.api_key),
                                  "image_generation": svc.images is not None,
+                                 "reasoning_effort_default": svc.effort_default(),
                                  "loaded": svc.loaded(), "service": "strata"})
             elif path.startswith("/v1/images/files/"):
                 # response_format url: the name (32 random hex digits) is the access, as an OpenAI image URL is
@@ -7400,7 +7443,7 @@ def make_handler(svc: Service):
             params = {names.get(k, k): v for k, v in defaults.items()
                       if k in ("temperature", "top_p", "top_k", "min_p", "seed", "repetition_penalty",
                                "presence_penalty", "frequency_penalty", "penalty_last_n")}
-            params["n_predict"] = svc.shared.get("max_tokens", -1)
+            params["n_predict"] = svc.shared.get("max_tokens", svc.default_max_tokens or -1)
             props = {"default_generation_settings": {"n_ctx": svc.reported_ctx(), "params": params},
                      "total_slots": max(1, int(getattr(svc.engine, "batch", 0) or 0)),   # #1004: the batch slots
                      "model_alias": svc.model, "chat_template": svc.template.source,
@@ -7596,7 +7639,7 @@ def make_handler(svc: Service):
             if tool_choice_of(req.get("tool_choice"))[0] == "none":   # as the Responses route: no tools are offered
                 tools = None
             force = svc.force_text(forced_call(req.get("tool_choice"), tools))      # a bad value is a 400 before anything is sent
-            messages, validator = prepare_format(req.get("response_format"), messages)
+            messages, validator = native_schema.prepare_format(req.get("response_format"),messages,svc,req)
             if validator is not None and (tools or req.get("strata_mcp")):
                 raise ValueError("structured response_format with tools/MCP is not supported")
             svc.load()
@@ -7638,6 +7681,8 @@ def make_handler(svc: Service):
             cancel = threading.Event()
             self._watch_client(cancel)                       # #430 #431 (#1999: before prepare, which can take long)
             ids, thinking, max_new = svc.prepare(messages, tools, kw, max_new, force=force, req=req, cancel=cancel)
+            native_tools.prepare(req,tools,svc)
+            native_schema.bind_request(req,validator,svc.tok,thinking)
             _debug_req("openai", req, messages, tools, max_new, thinking, len(ids))
             run = run_with_mcp(svc, svc.mcp, messages, tools, kw, ids, thinking, max_new, max_req, req, cancel,
                                {t["name"] for t in extra}) if use_mcp else None
@@ -7715,7 +7760,7 @@ def make_handler(svc: Service):
                 return self._json(503, responses_error_body(str(e), "server_error", code="server_error"))
 
             def check(text, finish):
-                return validated_json(text, validator, finish)
+                return native_schema.validated_raw(text,validator,finish) if getattr(validator,"native",False) else validated_json(text, validator, finish)
 
             def events():
                 yield from asm.start()
@@ -7800,7 +7845,7 @@ def make_handler(svc: Service):
             except ValueError as e:
                 raise ResponsesError(str(e), "input") from None
             try:
-                messages, validator = prepare_format(responses_api.text_format(req), messages, with_tools=bool(tools))
+                messages, validator = native_schema.prepare_format(responses_api.text_format(req),messages,svc,req,with_tools=bool(tools))
             except ValueError as e:
                 raise ResponsesError(str(e).replace("response_format", "text.format"), "text.format") from None
             noted = svc.__dict__.setdefault("hosted_tools_noted", set())   # said once per tool, not per request
@@ -7810,6 +7855,8 @@ def make_handler(svc: Service):
                 noted.update(skipped)
             if req.get("max_output_tokens") is None and "max_tokens" in svc.shared:   # the shared Chat settings
                 req = {**req, "max_output_tokens": svc.shared["max_tokens"]}
+            elif req.get("max_output_tokens") is None and svc.default_max_tokens:
+                req = {**req, "max_output_tokens": svc.default_max_tokens}
             try:
                 svc.reasoning_budget(req)                    # a bad value is a 400 before anything is sent
             except ValueError as e:
@@ -7843,6 +7890,8 @@ def make_handler(svc: Service):
                     from None
             if svc.codex_compaction_cache:
                 responses_api.prompt_made(req, shown)
+            native_tools.prepare(req,tools,svc)
+            native_schema.bind_request(req,validator,svc.tok,thinking)
             _debug_req("responses", req, messages, tools, max_new, thinking, len(ids))
             include = req.get("include") if isinstance(req.get("include"), list) else []
             asm = responses_api.Assembler(req, svc.model_for(req), len(ids), names,
@@ -7874,6 +7923,8 @@ def make_handler(svc: Service):
             cancel = threading.Event()
             self._watch_client(cancel)                       # #430 #431 (#1999: before prepare, which can take long)
             ids, thinking, max_new = svc.prepare(messages, tools, kw, max_new, force=force, req=req, cancel=cancel)
+            req.pop("_native_grammar",None)
+            native_tools.prepare(req,tools,svc)
             _debug_req("anthropic", req, messages, tools, max_new, thinking, len(ids))
             events = anthropic_events(svc, req, ids, thinking, tools, max_new, cancel, force=force)
             events = self._capture(events, "anthropic")
@@ -8230,7 +8281,7 @@ SHARED_KEYS = ("reasoning_effort", "reasoning_budget_tokens", "temperature", "to
                "experimental_speed_projection")
 
 
-def clean_shared_defaults(d) -> dict:
+def clean_shared_defaults(d, family=None) -> dict:
     """The Chat settings other apps get (POST /settings): only known keys, each checked; ValueError names a bad one."""
     if d is None:
         return {}
@@ -8242,8 +8293,13 @@ def clean_shared_defaults(d) -> dict:
             continue
         number = isinstance(value, (int, float)) and not isinstance(value, bool)
         if key == "reasoning_effort":
-            if value not in ("none", "low", "medium", "high"):
-                raise ValueError("reasoning_effort: none, low, medium or high")
+            numeric = family == "deepseek41" and ((type(value) is int and 1 <= value <= 100)
+                       or (isinstance(value, str) and re.fullmatch(r"(?:[1-9][0-9]?|100)", value)))
+            if numeric:
+                value = int(value)
+            elif value not in ("none", "low", "medium", "high"):
+                raise ValueError("reasoning_effort: none, low, medium or high"
+                                 + (", or an integer 1..100" if family == "deepseek41" else ""))
         elif key == "temperature":
             if not number or not 0 <= value <= 2:
                 raise ValueError("temperature: 0..2")
@@ -8251,8 +8307,10 @@ def clean_shared_defaults(d) -> dict:
             if not number or not 0 < value <= 1:
                 raise ValueError("top_p: 0 < top_p <= 1")
         elif key == "top_k":
-            if not number or value != int(value) or not 1 <= value <= 64:
-                raise ValueError("top_k: an integer 1..64")
+            hi=2147483647 if family=="deepseek41" else 64
+            lo=0 if family=="deepseek41" else 1
+            if not number or value != int(value) or not lo <= value <= hi:
+                raise ValueError(f"top_k: an integer {lo}..{hi}")
             value = int(value)
         elif key in ("seed", "max_tokens"):
             if not number or value != int(value) or value <= 0:
@@ -8408,8 +8466,9 @@ def sampling_defaults_from_config(cfg: dict) -> dict:
                 raise SystemExit(f"[strata] config sampling.min_p={value!r}: expected 0 <= min_p <= 1")
             out[key] = float(value)
         elif key == "top_k":
-            if not number or value != int(value) or not 1 <= value <= 64:
-                raise SystemExit(f"[strata] config sampling.top_k={value!r}: the sampled path takes an integer 1..64")
+            lo,hi=(0,2147483647) if cfg.get("arch")=="deepseek41" else (1,64)
+            if not number or value != int(value) or not lo <= value <= hi:
+                raise SystemExit(f"[strata] config sampling.top_k={value!r}: expected integer {lo}..{hi}")
             out[key] = int(value)
         elif key == "presence_penalty":
             if not number or value < 0:
@@ -8556,6 +8615,9 @@ def check_request_sampling(req) -> None:
             req[key] = value = num
         if isinstance(value, bool) or not isinstance(value, int if integer else (int, float)):
             raise ValueError(f"{key}: {'an integer' if integer else 'a number'}")
+        if key=="top_k" and not 0<=value<=2147483647:
+            raise ValueError("top_k: an integer 0..2147483647 (0: unlimited)")
+        if not integer and not math.isfinite(value):raise ValueError(f"{key}: a finite number")
 
 
 # the API's model name per model family (the GGUF architecture, "arch" in the config) when the config names none
@@ -9007,6 +9069,15 @@ def main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> in
         svc.requested_slots = per_replica * len(groups) if groups else per_replica
     svc.answer_room = cfg.get("answer_room") is not False
     svc.reasoning_close_retry = cfg.get("reasoning_close_retry") is True    # #1053: opt-in, off by default
+    svc.default_max_tokens = clean_shared_defaults({"max_tokens": cfg["default_max_tokens"]}).get("max_tokens", 0) \
+        if cfg.get("default_max_tokens") is not None else 0
+    svc.require_strict_schema_constraint = cfg.get("require_strict_schema_constraint") is True
+    svc.report_output_budget = cfg.get("report_output_budget") is True
+    if "context_slack_tokens" in cfg:
+        slack = cfg["context_slack_tokens"]
+        if type(slack) is not int or slack < 0 or (slack < CTX_SLACK and svc.family != "deepseek41"):
+            raise SystemExit("[strata] context_slack_tokens must be a non-negative integer; only DeepSeek supports less than 8")
+        svc.context_slack_tokens = slack
     if cfg.get("images"):                               # image generation (serve/images.py), set up by setup --images
         icfg = {k: (os.path.abspath(os.path.join(cfg.get("cwd") or ".", v))
                     if k in ("exe", "diffusion_model", "vae", "llm", "out_dir") and isinstance(v, str)
@@ -9028,7 +9099,7 @@ def main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> in
     svc.keep_awake = KeepAwake.create(cfg.get("prevent_sleep") is True)      # #1727: opt-in, Windows only
     if cfg.get("reasoning_effort") is not None:         # #1641: the thinking level of requests that name none
         try:
-            svc.config_effort = clean_shared_defaults({"reasoning_effort": cfg["reasoning_effort"]}).get("reasoning_effort")
+            svc.config_effort = clean_shared_defaults({"reasoning_effort": cfg["reasoning_effort"]}, family=svc.family).get("reasoning_effort")
         except ValueError as e:
             raise SystemExit(f"[strata] config {e}")
         if svc.config_effort:
@@ -9150,7 +9221,7 @@ def main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> in
     if a.config:                                        # the Chat settings shared with other apps, from last time
         svc.shared_path = str(Path(a.config).with_suffix("")) + ".shared-settings.json"
         try:
-            svc.shared = clean_shared_defaults(json.loads(Path(svc.shared_path).read_text(encoding="utf-8")))
+            svc.shared = clean_shared_defaults(json.loads(Path(svc.shared_path).read_text(encoding="utf-8")), family=svc.family)
             if svc.shared:
                 print("[strata] other apps use the Chat settings: " +
                       ", ".join(f"{k}={v}" for k, v in svc.shared.items()), flush=True)

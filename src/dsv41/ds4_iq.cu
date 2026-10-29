@@ -1165,9 +1165,27 @@ void launch_dn(const Args& a, int groups, cudaStream_t s) {
     else
         strata_ds4_launch(down_kernel<T, NE>, dim3((unsigned) tiles, (unsigned) groups), kThreads, 0, s, a, groups);
 }
+// Opt-in two-entry scheduling for common two-token verifier windows.
+// Each entry keeps the same dot-product order; the release dispatch stays NE=4.
+template <int T>
+bool pair_window_enabled() {
+#if defined(STRATA_USE_HIP)
+    return false;
+#else
+    if constexpr (T == kIQ2_XXS || T == kIQ2_XS || T == kIQ1_M) {
+        static const bool on = [] {
+            const char* v = std::getenv("DS4_IQ_PAIR_WINDOW");
+            return v && std::atoi(v) != 0;
+        }();
+        return on;
+    }
+    return false;
+#endif
+}
 template <int T>
 void gu_ne(const Args& a, int groups, int ne, cudaStream_t s) {
     if (ne <= 1) launch_gu<T, 1>(a, groups, s);
+    else if (ne == 2 && pair_window_enabled<T>()) launch_gu<T, 2>(a, groups, s);
     else if (ne <= 4) launch_gu<T, 4>(a, groups, s);
     else if (ne <= 8) launch_gu<T, 8>(a, groups, s);
     else launch_gu<T, 16>(a, groups, s);
@@ -1175,6 +1193,7 @@ void gu_ne(const Args& a, int groups, int ne, cudaStream_t s) {
 template <int T>
 void dn_ne(const Args& a, int groups, int ne, cudaStream_t s) {
     if (ne <= 1) launch_dn<T, 1>(a, groups, s);
+    else if (ne == 2 && pair_window_enabled<T>()) launch_dn<T, 2>(a, groups, s);
     else if (ne <= 4) launch_dn<T, 4>(a, groups, s);
     else if (ne <= 8) launch_dn<T, 8>(a, groups, s);
     else launch_dn<T, 16>(a, groups, s);
@@ -1272,9 +1291,27 @@ bool light_set(const SetArgs& a, bool gu, cudaStream_t s) {
     return true;
 }
 
+// Opt-in dense K-quant decode GEMV column capacity. Keep all other types and
+// column counts on the original 1/4/16 kernels. Parse once, no runtime logging.
+bool exact_dense_columns() {
+    static const bool enabled=[] {
+        const char* v=std::getenv("DS4_IQ_EXACT_COLS");
+        return v!=nullptr && std::atoi(v)==1;
+    }();
+    return enabled;
+}
+
 template <int T>
 void mv_nc(const Jobs& J, int nj, int max_n, int max_c, cudaStream_t s) {
     const dim3 grid((unsigned) ((max_n + kWarps - 1) / kWarps), (unsigned) nj);
+    if constexpr (T==kQ5_K || T==kQ6_K) {
+        if (exact_dense_columns()) {
+            if constexpr (T==kQ6_K) {
+                if (max_c==2) { strata_ds4_launch(mv_kernel<T, 2>, grid, kThreads, 0, s, J); return; }
+            }
+            if (max_c==6) { strata_ds4_launch(mv_kernel<T, 6>, grid, kThreads, 0, s, J); return; }
+        }
+    }
     if (max_c <= 1) strata_ds4_launch(mv_kernel<T, 1>, grid, kThreads, 0, s, J);
     else if (max_c <= 4) strata_ds4_launch(mv_kernel<T, 4>, grid, kThreads, 0, s, J);
     else strata_ds4_launch(mv_kernel<T, 16>, grid, kThreads, 0, s, J);

@@ -6,6 +6,8 @@
 //   iq_expert_test [--type 16,17,18,21,22,23,29] [--bench] [--iq256 0|1]
 #include "../../src/dsv41/ds4_gguf_cpu.hpp"
 #include "../../src/dsv41/ds4_iq.cuh"
+#include "../../src/dsv41/ds4_demand_prepare.hpp"
+#include "../../src/dsv41/ds4_os.hpp"
 
 #include "strata/dsv41/hip_or_cuda.h"   // HIP names on a HIP build, the CUDA runtime otherwise
 
@@ -198,6 +200,21 @@ static void real_shape_bits(int type) {
     if (!iq::gate_up(a, NG, 3, 0) || !iq::down(a, NG, 3, 0)) { std::printf("real shape grouped: refused\n"); return; }
     CK(hipDeviceSynchronize());
     { auto h = down_(dh, (size_t) NEnt * FF); bits("real grp h", type, h.data(), h.size() * 4); auto p = down_(dp, (size_t) NEnt * E); bits("real grp part", type, p.data(), p.size() * 4); }
+    // Two-token verifier groups: scheduling specialization must preserve all bits.
+    {
+        a.grp_start = up(std::vector<int>{0, 2, 4});
+        a.grp_ent = up(std::vector<int>{0, 1, 8, 9});
+        CK(hipMemset(dh, 0, (size_t) NEnt * FF * 4));
+        CK(hipMemset(dp, 0, (size_t) NEnt * E * 4));
+        if (!iq::gate_up(a, NG, 2, 0) || !iq::down(a, NG, 2, 0)) {
+            std::printf("real shape two-token window: refused\n"); std::exit(2);
+        }
+        CK(hipDeviceSynchronize());
+        auto h = down_(dh, (size_t) NEnt * FF);
+        auto p = down_(dp, (size_t) NEnt * E);
+        bits("real pair h", type, h.data(), h.size() * 4);
+        bits("real pair part", type, p.data(), p.size() * 4);
+    }
     // more windows: a bound of 7 groups with 3 live (dynamic count), 5/1/3 entries (ne_max 5: the 8-entry kernels), then 9 groups of
     // one entry with 4 live; entries index the h/hq rows, their input row is entry >> 3
     {
@@ -576,7 +593,10 @@ int main(int argc, char** argv) {
                 // (the CPU lane rounds the activation to its own type - Q8_K, one F32 scale per 256 values - so the
                 //  reference is that quantized activation, not the device's per-32 one)
                 const std::vector<float> xhat = act_values(fm.gu_act, act.data(), E);
-                double wg = 0, wd = 0;
+                double wg = 0, wd = 0, wp = 0;
+                strata::ds4::DemandPrepare prepare([](const auto& range) {
+                    strata::ds4::os::prefetch_chunked({range}, 128 << 10);
+                });
                 for (int e = 0; e < NEXP; ++e) {
                     std::vector<float> hc(FF), yc(E);
                     float* hp[1] = {hc.data()}; float* yp[1] = {yc.data()};
@@ -593,7 +613,26 @@ int main(int argc, char** argv) {
                     const void* hpp[1] = {hact.data()};
                     gg::iq_cpu_down(fm, &blobs[e * blob + off[2]], hpp, 1, yp, 0, E);
                     for (int r = 0; r < E; ++r) { double sa; const double ref = dotd(&D[e].w[(size_t) r * FF], hhat.data(), FF, &sa); wd = std::max(wd, std::fabs(yc[r] - ref) / (sa + 1e-30)); }
+                    // Same CPU rows while confirmed preparation runs; exact output and scoped ownership.
+                    std::vector<uint8_t> hactcpu(fm.h_bytes);
+                    gg::iq_cpu_quant(fm.d_act, hc.data(), FF, hactcpu.data());
+                    std::vector<float> ycpu(E);
+                    const void* hpactcpu[1] = {hactcpu.data()};
+                    float* ypcpu[1] = {ycpu.data()};
+                    gg::iq_cpu_down(fm, &blobs[e * blob + off[2]], hpactcpu, 1, ypcpu, 0, E);
+                    std::vector<float> hpipe(FF), ypipe(E);
+                    float* hppipe[1] = {hpipe.data()}; float* yppipe[1] = {ypipe.data()};
+                    auto ticket = prepare.start({{&blobs[e * blob], blob}});
+                    gg::iq_cpu_gate_up(fm, &blobs[e * blob + off[0]], &blobs[e * blob + off[1]], ap, 1, hppipe, 0, FF, lim);
+                    std::vector<uint8_t> hactpipe(fm.h_bytes);
+                    gg::iq_cpu_quant(fm.d_act, hpipe.data(), FF, hactpipe.data());
+                    const void* hpactpipe[1] = {hactpipe.data()};
+                    gg::iq_cpu_down(fm, &blobs[e * blob + off[2]], hpactpipe, 1, yppipe, 0, E);
+                    ticket.finish();
+                    if (std::memcmp(hc.data(), hpipe.data(), FF * sizeof(float)) ||
+                        std::memcmp(ycpu.data(), ypipe.data(), E * sizeof(float))) wp = 1;
                 }
+                report("cpu demand identical", type, wp, 0);
                 report("cpu gate_up vs ref", type, wg, 1e-5);
                 report("cpu down vs ref", type, wd, 1e-5);
                 std::printf("%-7s cpu rows: %s\n", iq::name(type), gg::iq_cpu_own_rows(type) ? "Strata AVX2" : "ggml-cpu");

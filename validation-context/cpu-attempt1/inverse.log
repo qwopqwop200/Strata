@@ -1,0 +1,17 @@
+{
+  "status": "PASS",
+  "source_inverse": {
+    "src/dsv41/ds4_model.cu": {
+      "base_sha256": "35d72ce215dabe6ad8318c6237dba63885dde5049deecb2d523b90aa0dcc176e",
+      "actual_sha256": "09a2ae1b0a0efd5c0d8845e5da6e6983a49818f79003b7b12c9c556529833608",
+      "inverse_exact": true
+    },
+    "src/dsv41/ds4_main.cpp": {
+      "base_sha256": "bb260e2f4f01359ae94995be65577dd866d4eadc573beca0e223e0db6aaac55e",
+      "actual_sha256": "789f2425fdd25b1bbe0f6642916501b60b1a47d5daab2d54e9c918b9a80344c7",
+      "inverse_exact": true
+    }
+  },
+  "runtime_contract": "strict1 optin capacity/input guard; no math/layout/YOCO/dispatch changes",
+  "CUDA_GPU_model_runs": 0
+}

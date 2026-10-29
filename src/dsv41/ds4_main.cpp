@@ -26,6 +26,7 @@
 #endif
 #include "ds4_launch.h"   // ds4_dbg
 #include "ds4_model.hpp"
+#include "ds4_context_capacity.hpp"
 #include "ds4_experts_rule.hpp"
 #include "ds4_os.hpp"
 #include "ds4_packinfo.hpp"
@@ -238,8 +239,11 @@ bool round(strata::ds4::Model& m, int tok, int room, bool spec, float conf_min, 
         int keep = 0;
         if (cum_min < 0) cum_min = dspark_cum_default(m);
         float cum = 1.0f;
-        while (keep < (int) drafts.size() && keep < room - 1 && keep < g_spec_depth && conf[(size_t) keep] >= conf_min &&
-               (cum *= conf[(size_t) keep]) >= cum_min)
+        // A sampled q must not be selected conditionally on its sampled token/confidence: that would
+        // change q after it was saved. Deterministic argmax drafts retain the existing confidence gate.
+        const bool sampled_q=temperature>0 && std::getenv("DS4_DSPARK_SAMPLE") && std::atoi(std::getenv("DS4_DSPARK_SAMPLE"))!=0;
+        while (keep < (int) drafts.size() && keep < room - 1 && keep < g_spec_depth &&
+               (sampled_q || (conf[(size_t) keep] >= conf_min && (cum *= conf[(size_t) keep]) >= cum_min)))
             ++keep;
         if (keep > 0) {
             drafts.resize((size_t) keep);
@@ -275,8 +279,9 @@ bool round(strata::ds4::Model& m, int tok, int room, bool spec, float conf_min, 
 
 struct Req {
     long long max_new = 0;
-    float temperature = 0.0f, top_p = 1.0f, min_p = 0.0f;
-    int top_k = 64;
+    float temperature = 1.0f, top_p = 1.0f, min_p = 0.0f;
+    int top_k = 0;
+    std::string grammar_file;
     unsigned long long seed = 0;
     int spec = -1;          // spec=0|1: this request drafts or not (-1: as the engine was started)
     float conf = -1.0f;     // dspark_conf=F: the drafts' confidence floor for this request (-1: the engine's)
@@ -375,6 +380,7 @@ bool parse_gen(const std::string& line, Req& r, bool geni) {
         if (k == "temperature") r.temperature = std::strtof(v.c_str(), nullptr);
         else if (k == "top_p") r.top_p = std::strtof(v.c_str(), nullptr);
         else if (k == "top_k") r.top_k = std::atoi(v.c_str());
+        else if (k == "grammar") r.grammar_file = v;
         else if (k == "min_p") r.min_p = std::strtof(v.c_str(), nullptr);
         else if (k == "seed") r.seed = std::strtoull(v.c_str(), nullptr, 10);
         else if (k == "spec") r.spec = std::atoi(v.c_str()) != 0;
@@ -728,6 +734,13 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
             std::fflush(stdout);
             continue;
         }
+        try {
+            m.set_grammar(r.grammar_file.empty()?nullptr:strata::ds4::Grammar::load(r.grammar_file,m.vocab()));
+        } catch(const std::exception& e) {
+            std::printf("ERR grammar: %s\nDONE 0 %zu 0 0 cancel 0 0 0 0 0\n",e.what(),r.ids.size());std::fflush(stdout);continue;
+        }
+        std::fprintf(stderr,"ds4 sampler: full_vocab=1 vocab=%d top_k=%d temperature=%g top_p=%g grammar=%d\n",
+                     m.vocab(),r.top_k,r.temperature,r.top_p,!r.grammar_file.empty());
         const double t0 = now_ms();
         std::vector<Pic> pics;
         {
@@ -900,6 +913,22 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
             held.clear();
             continue;
         }
+        // ATOMIC_CONTEXT_INPUT_BEGIN
+        if (strata::ds4::context_capacity::requested(std::getenv("DS4_CONTEXT_CAPACITY_CHECK"))) {
+            const bool matched = m.pos() == (int64_t) r.ids.size() && done == r.ids.size();
+            const uint64_t fingerprint = strata::ds4::context_capacity::input_fingerprint(r.ids.data(), r.ids.size());
+            std::fprintf(stderr, "ds4 context input: requested=1 input_tokens=%zu fresh_from=%zu prompt_read=%zu engine_position=%lld context=%lld reuse_enabled=%d input_fnv64=%016llx full_input_position_match=%d\n",
+                         r.ids.size(), from, done - from, (long long) m.pos(), (long long) m.max_context(),
+                         reuse ? 1 : 0, (unsigned long long) fingerprint, matched ? 1 : 0);
+            if (!matched) {
+                std::printf("ERR context input position mismatch\n");
+                std::fflush(stdout);
+                m.reset();
+                held.clear();
+                continue;
+            }
+        }
+        // ATOMIC_CONTEXT_INPUT_END
         held = std::move(pics);
         m.checkpoint(0);
         if (!continued && slot_max > 0) m.pin();   // (a new run of prompts: where it may be rendered again from)
@@ -984,6 +1013,7 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
         //  the checkpoint at this prompt's end)
         stat_line();
         const double t2 = now_ms();
+        m.report_grammar();
         std::printf("DONE %lld %zu %.1f %.1f %s %lld %lld %zu 0 0\n", produced, r.ids.size(), t1 - t0, t2 - t1, finish,
                     d_acc, d_off, from);
         std::fflush(stdout);
@@ -997,6 +1027,12 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
                      s.experts ? 100.0 * (double) s.cpu_experts / (double) s.experts : 0.0);
         if (d_off > 0) std::fprintf(stderr, "maya ds4 serve: drafts %lld of %lld kept; %s\n", d_acc, d_off,
                                     per_position(s_dec, s).c_str());
+        if (std::getenv("DS4_TIMINGS") || std::getenv("DS4_PROF")) {
+            std::fprintf(stderr, "ds4 request timing: draft %.2f ms, verify-forward %.2f ms, CPU-lane %.2f ms, "
+                                 "host-layer-submit %.2f ms, head-sync %.2f ms, Engram %.2f ms (overlap allowed)\n",
+                         s.draft_ms - s_dec.draft_ms, s.verify_ms - s_dec.verify_ms, s.cpu_ms - s_dec.cpu_ms,
+                         s.layer_ms - s_dec.layer_ms, s.head_ms - s_dec.head_ms, s.engram_ms - s_dec.engram_ms);
+        }
         m.save_profile();
     }
     // the engine ends (QUIT or the end of its input): the conversation in the model is set aside, and every one in
@@ -1479,7 +1515,7 @@ int main(int argc, char** argv) {
     long long d_off = 0, d_acc = 0, rounds = 0;
     bool cool = false;
     if (n > 0) {
-        int tok = m.sample(temp, 1.0f, temp > 0 ? 64 : 1, 0.0f, cli_seed, counter++);
+        int tok = m.sample(temp, 1.0f, temp > 0 ? 0 : 1, 0.0f, cli_seed, counter++);
         std::vector<int> got;
         for (;;) {
             out.push_back(tok);
@@ -1502,7 +1538,7 @@ int main(int argc, char** argv) {
             if (got.empty()) {
                 int off = 0, acc = 0;
                 const bool try_spec = spec && !cool;
-                if (!round(m, tok, n - (int) out.size(), try_spec, o.dspark_conf, temp, 1.0f, temp > 0 ? 64 : 1, 0.0f,
+                if (!round(m, tok, n - (int) out.size(), try_spec, o.dspark_conf, temp, 1.0f, temp > 0 ? 0 : 1, 0.0f,
                            cli_seed, counter, got, off, acc, err)) {
                     std::fprintf(stderr, "maya-ds4: %s\n", err.c_str());
                     return 1;

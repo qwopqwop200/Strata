@@ -27,7 +27,7 @@ import json
 import time
 import uuid
 
-from serve.frontend import Event, _late_system_to_user, _parts_of, effort_kwargs
+from serve.frontend import Event, _late_system_to_user, _parts_of, effort_kwargs, tool_choice_of
 
 ENCRYPTED_PREFIX = "strata.r1:"                   # our own reasoning replay strings; others' are ignored
 HOSTED_TOOLS = ("web_search", "web_search_preview", "file_search", "computer_use_preview", "computer_use",
@@ -263,7 +263,8 @@ def request_tools(req: dict):
                 description += f"\n\nThe input must follow this {fmt.get('syntax', '')} grammar:\n{fmt['definition']}"
             params = {"type": "object", "properties": {"input": {"type": "string", "description": "the raw input"}},
                       "required": ["input"]}
-        tools.append({"name": flat, "description": description, "parameters": params})
+        tools.append({"name": flat, "description": description, "parameters": params,
+                      **({"strict":tool["strict"]} if "strict" in tool else {})})
         names[flat] = (namespace, name, kind)
 
     for i, tool in enumerate(given):
@@ -284,7 +285,11 @@ def request_tools(req: dict):
         else:
             raise ResponsesError("a tool needs a type", param + ".type")
     choice = req.get("tool_choice")
-    if choice == "none":
+    kind, _ = tool_choice_of(choice)
+    if kind not in ("auto", "none"):
+        raise ResponsesError('tool_choice supports only auto or none on this route; use Chat Completions for required or named tools',
+                             "tool_choice", "unsupported_parameter")
+    if kind == "none":
         return None, names, skipped
     return tools or None, names, skipped
 

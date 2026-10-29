@@ -96,6 +96,17 @@ void gemv_f16_rows(const uint16_t* W, const float* x, size_t ldx, int n, int k, 
 /// the token, window and chunk paths get the same bits.
 void gemv_f32(const float* W, const float* x, int n, int k, int T, float* y, int ldy, cudaStream_t s);
 
+// Independent router matrices on the same x. Host-only descriptor: the wrapper unpacks
+// scalar arguments for NJ=2/3 kernels; the device never indexes this array.
+struct F32RouterJobs {
+    const float* w[3] = {};
+    float* y[3] = {};
+    int n[3] = {};
+    int count = 0;
+};
+void gemv_f32_router_static(const F32RouterJobs& jobs, const float* x, int k, int T, int ldy, cudaStream_t s);
+
+
 /// The router, row t: scores = sqrt(softplus(logits[t])) (n experts, rows 1024 apart), the top `k` of scores + bias;
 /// weights from the unbiased scores, normalized to sum 1 (+1e-20) and times route_scale -> idx[t][i], w[t][i] (rows
 /// kPicks apart).  Rows of image tokens (bit t of vl) take bias_vl instead (training's noaux_tc_for_vl).

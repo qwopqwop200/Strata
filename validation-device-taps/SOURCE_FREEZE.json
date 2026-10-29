@@ -1,0 +1,12 @@
+{
+  "base": "833b226e5dee8be9508cb1be04632589b01bc94a",
+  "files": {
+    "src/dsv41/ds4_model.cu": "7b353265f384a2660c644021768a153e91d15bbbd3ed2df224651f37d974b239",
+    "tests/dsv41/device_taps_test.py": "dfb9ca5fb549fbaafd331b04608ad461a206e3129c00195ac1c7d3a87bfda6e1",
+    "tests/dsv41/device_taps_stub.inc": "283a59c618a1defa2fcc0bc5ef4bb2206def497585b72e8da0d1372e32a1877c"
+  },
+  "runtime_writer_released": true,
+  "cuda_runs": 0,
+  "model_runs": 0,
+  "cpu_compile_runs": 0
+}

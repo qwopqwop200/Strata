@@ -504,6 +504,83 @@ __global__ void __launch_bounds__(kThreads) gemv_f32_kernel(const float* __restr
     if (lane == 0) y[(size_t) t * ldy + row] = acc;
 }
 
+// PREFILL_ROUTER_REUSE_BEGIN
+#if defined(__CUDACC__) && !defined(STRATA_USE_HIP) && !defined(STRATA_METAL)
+bool prefill_router_reuse_enabled() {
+    static const bool enabled = [] {
+        const char* v = std::getenv("DS4_PREFILL_ROUTER_REUSE");
+        return v != nullptr && std::strcmp(v, "1") == 0;
+    }();
+    return enabled;
+}
+// Two independent tokens share each float4 weight load. Each accumulator keeps
+// the original four fmaf operations and warp XOR reduction order.
+__global__ void __launch_bounds__(kThreads) gemv_f32_prefill_pair_kernel(
+    const float* __restrict__ W, const float* __restrict__ x, int n, int k, int T,
+    float* __restrict__ y, int ldy) {
+    const int row = blockIdx.x * (kThreads / 32) + (threadIdx.x >> 5);
+    const int lane = threadIdx.x & 31, t = 2 * blockIdx.y;
+    if (row >= n) return;
+    const float4* w = (const float4*) (W + (size_t) row * k);
+    const float4* x0 = (const float4*) (x + (size_t) t * k);
+    const bool second = t + 1 < T;
+    const float4* x1 = second ? (const float4*) (x + (size_t) (t + 1) * k) : x0;
+    float a0 = 0.0f, a1 = 0.0f;
+    for (int c = lane; c < k / 4; c += 32) {
+        const float4 a = w[c], b0 = x0[c];
+        a0 = fmaf(a.x, b0.x, a0);
+        a0 = fmaf(a.y, b0.y, a0);
+        a0 = fmaf(a.z, b0.z, a0);
+        a0 = fmaf(a.w, b0.w, a0);
+        if (second) {
+            const float4 b1 = x1[c];
+            a1 = fmaf(a.x, b1.x, a1);
+            a1 = fmaf(a.y, b1.y, a1);
+            a1 = fmaf(a.z, b1.z, a1);
+            a1 = fmaf(a.w, b1.w, a1);
+        }
+    }
+    a0 = warp_sum(a0);
+    if (second) a1 = warp_sum(a1);
+    if (lane == 0) {
+        y[(size_t) t * ldy + row] = a0;
+        if (second) y[(size_t) (t + 1) * ldy + row] = a1;
+    }
+}
+#endif
+// PREFILL_ROUTER_REUSE_END
+
+// Direct kernel parameters, not a device-indexed by-value array. NJ removes the unused third job.
+// The selected row still uses the original float4/FMA and XOR reduction order.
+template <int NJ>
+__global__ void __launch_bounds__(kThreads) gemv_f32_router_static_kernel(
+    const float* __restrict__ W0, const float* __restrict__ W1, const float* __restrict__ W2,
+    float* __restrict__ Y0, float* __restrict__ Y1, float* __restrict__ Y2,
+    int n0, int n1, int n2, const float* __restrict__ x, int k, int ldy) {
+    const int j = blockIdx.z;
+    const float* __restrict__ W = j == 0 ? W0 : W1;
+    float* __restrict__ y = j == 0 ? Y0 : Y1;
+    int n = j == 0 ? n0 : n1;
+    if constexpr (NJ == 3) {
+        if (j == 2) { W = W2; y = Y2; n = n2; }
+    }
+    const int row = blockIdx.x * (kThreads / 32) + (threadIdx.x >> 5);
+    const int lane = threadIdx.x & 31, t = blockIdx.y;
+    if (row >= n) return;
+    const float4* w = (const float4*) (W + (size_t) row * k);
+    const float4* xv = (const float4*) (x + (size_t) t * k);
+    float acc = 0.0f;
+    for (int c = lane; c < k / 4; c += 32) {
+        const float4 a = w[c], b = xv[c];
+        acc = fmaf(a.x, b.x, acc);
+        acc = fmaf(a.y, b.y, acc);
+        acc = fmaf(a.z, b.z, acc);
+        acc = fmaf(a.w, b.w, acc);
+    }
+    acc = warp_sum(acc);
+    if (lane == 0) y[(size_t) t * ldy + row] = acc;
+}
+
 // ---------------------------------------------------------------- the router
 __global__ void __launch_bounds__(512) route_kernel(const float* __restrict__ logits, const float* __restrict__ bias,
                                                     int n, int k, float route_scale, int* idx, float* w,
@@ -2296,11 +2373,47 @@ void gemv_f16_rows(const uint16_t* W, const float* x, size_t ldx, int n, int k, 
 }
 
 void gemv_f32(const float* W, const float* x, int n, int k, int T, float* y, int ldy, cudaStream_t s) {
+// PREFILL_ROUTER_REUSE_DISPATCH_BEGIN
+#if defined(__CUDACC__) && !defined(STRATA_USE_HIP) && !defined(STRATA_METAL)
+    // Only the current pack's large prompt router. Window/decode and static
+    // router batching keep their original dispatch, buffers and launch order.
+    if (prefill_router_reuse_enabled() && T > 16 && T <= 8192 && n == 384 && k == 5120 && ldy == 1024) {
+        strata_ds4_launch(gemv_f32_prefill_pair_kernel,
+                         dim3(cdiv(n, kThreads / 32), cdiv(T, 2)), kThreads, 0, s,
+                         W, x, n, k, T, y, ldy);
+        static std::once_flag reported;
+        std::call_once(reported, [=] {
+            std::fprintf(stderr, "ds4 prefill router reuse: requested=1 dispatch_selected=1 tokens_per_warp=2 first_T=%d n=384 k=5120 ldy=1024 scope=process_first_dispatch kernel_completion_certified=0\n", T);
+        });
+        return;
+    }
+#endif
+// PREFILL_ROUTER_REUSE_DISPATCH_END
 #if defined(STRATA_METAL)
     if (T > 0 && ::strata::dsv41::metal_host::gemv_f32(W, x, n, k, T, y, ldy)) return;
 #endif
     if (T > 0) strata_ds4_launch(gemv_f32_kernel, dim3(cdiv(n, kThreads / 32), T), kThreads, 0, s, W, x, n, k, y, ldy);
 }
+
+void gemv_f32_router_static(const F32RouterJobs& jobs, const float* x, int k, int T, int ldy, cudaStream_t s) {
+    if (jobs.count <= 0 || jobs.count > 3 || T <= 0) return;
+    if (jobs.count == 1) {
+        gemv_f32(jobs.w[0], x, jobs.n[0], k, T, jobs.y[0], ldy, s);
+        return;
+    }
+    int n = 0;
+    for (int j = 0; j < jobs.count; ++j) n = std::max(n, jobs.n[j]);
+    const dim3 grid(cdiv(n, kThreads / 32), T, jobs.count);
+    if (jobs.count == 2)
+        strata_ds4_launch(gemv_f32_router_static_kernel<2>, grid, kThreads, 0, s,
+            jobs.w[0], jobs.w[1], nullptr, jobs.y[0], jobs.y[1], nullptr,
+            jobs.n[0], jobs.n[1], 0, x, k, ldy);
+    else
+        strata_ds4_launch(gemv_f32_router_static_kernel<3>, grid, kThreads, 0, s,
+            jobs.w[0], jobs.w[1], jobs.w[2], jobs.y[0], jobs.y[1], jobs.y[2],
+            jobs.n[0], jobs.n[1], jobs.n[2], x, k, ldy);
+}
+
 
 void route(const float* logits, const float* bias, int n, int k, int T, float route_scale, int* idx, float* w,
            cudaStream_t s, const float* bias_vl, const VlBits* vl) {

@@ -12,6 +12,7 @@
 //   moe(x): 6 of 384 routed experts (sqrt-softplus scores, biased top-k) + the shared expert
 //   h = post * moe + comb^T h;  pre = f_pre
 // and after the last layer logits = head(rmsnorm(sum_s pre[s] h[s])).
+#include "ds4_context_capacity.hpp"
 #include "ds4_launch.h"   // strata_ds4_launch: <<<>>> on CUDA and HIP, a dispatch on Metal
 #include "ds4_model.hpp"
 #include "ds4_pick_rule.hpp"
@@ -24,8 +25,12 @@
 #include "ds4_kernels.cuh"
 #include "ds4_os.hpp"
 #include "ds4_pool.hpp"
+#include "ds4_heat.hpp"
+#include "ds4_cache_scan.hpp"
 #include "ds4_store.hpp"
+#include "ds4_demand_prepare.hpp"
 #include "ds4_vision.cuh"
+#include "ds4_vision_contract.hpp"
 #include "strata/dsv41/exl3_cpu.hpp"
 #include "strata/dsv41/exl3.hpp"
 #include "strata/kernels/f16_bits.hpp"
@@ -62,6 +67,7 @@ extern "C" void ds4_busy_end();
 #include <map>
 #include <mutex>
 #include <numeric>
+#include <optional>
 #include <sstream>
 #include <thread>
 #include <unordered_map>
@@ -983,6 +989,10 @@ struct Model::Impl {
     int d_dev = 0;                    // the drafter's first block's device
     bool spec_win = false;            // the window being run is a draft's verification (layer() keeps backups)
     float* h_taps = nullptr;          // pinned [kWin][targets][dim]: the last window's taps
+    // Opt-in decode scratch; never aliases xe (the intervening trunk layers reuse xe).
+    float* d_decode_taps = nullptr;   // [kWin][3][5120], one serial CUDA stream only
+    bool device_taps_requested = std::getenv("DS4_DSPARK_DEVICE_TAPS") != nullptr &&
+                                 std::strcmp(std::getenv("DS4_DSPARK_DEVICE_TAPS"), "1") == 0;
     cudaEvent_t ev_seed = nullptr;    // the drafter's seeding read h_taps: the next window's taps wait for it
     float* d_confv = nullptr;         // on the head device
     int* d_ints = nullptr;            // on the head device: drafts in, picks out
@@ -991,6 +1001,8 @@ struct Model::Impl {
     // verify()'s rule - a point at the draft for the drafter's argmax; and the chain they were drawn with (verify()
     // checks it is its own)
     strata::dsv41k::SpecList* d_specq = nullptr;
+    double* d_spec_full = nullptr;
+    std::shared_ptr<Grammar> grammar;
     std::vector<strata::dsv41k::SpecList> h_specq = std::vector<strata::dsv41k::SpecList>(kWin);
     bool drafts_q = false;
     float dq_temp = 0.0f, dq_top_p = 1.0f, dq_min_p = 0.0f;
@@ -1086,6 +1098,16 @@ struct Model::Impl {
     // layer's critical path.  Only the page cache sees it - the outputs are the same.  DS4_AHEAD=0: off, 2: also the
     // layer after (from L's input too); DS4_AHEAD_EXTRA: guesses past the next layer's top k (< 0: fewer - the guess's
     // picks by rank on Sun: 97 91 81 70 57 41 %, past the top 6 29 20 %: reads wasted on an SSD-bound PC).
+    // Exact-value opt-in; evaluated once, no clocks/allocations/logs on the OFF path.
+    bool router_gemv_static_batch = [] {
+        const char* v = std::getenv("DS4_ROUTER_GEMV_STATIC_BATCH");
+        return v != nullptr && std::strcmp(v, "1") == 0;
+    }();
+    // Written only by the serial single-GPU Model owner; no worker or warm-up writes.
+    // Submitted path counts, not a CUDA completion or GPU-duration measurement.
+    uint64_t router_owner_async = 0, router_groups3 = 0;
+    uint64_t router_fallback_shape = 0, router_fallback_ahead = 0, router_fallback_near = 0;
+    uint64_t router_t3[4] = {};
     int ahead_mode = std::getenv("DS4_AHEAD") ? std::atoi(std::getenv("DS4_AHEAD")) : 1;
     int ahead_extra = std::getenv("DS4_AHEAD_EXTRA") ? std::atoi(std::getenv("DS4_AHEAD_EXTRA")) : 0;
     // (DS4_AHEAD_ORDER=0: the CPU lane computes a layer's experts in expert order, not the ones asked for early first)
@@ -1106,6 +1128,8 @@ struct Model::Impl {
         int ram = -1;   // (copy_mode, `in` held in RAM) the spare slot `out` is copied into from VRAM
     };
     static constexpr int kMaxSwaps = 8;
+    const bool c_round_robin = std::getenv("DS4_CACHE_ROUND_ROBIN") && std::atoi(std::getenv("DS4_CACHE_ROUND_ROBIN")) != 0;
+    CacheScan cache_scan;
     // the swap rule: a CPU-lane expert in when its heat passes the coldest VRAM one's x margin + bonus; heat x decay
     // every 256 tokens; at most `inflight` swaps under way (DS4_CACHE_MARGIN / _BONUS / _DECAY / _INFLIGHT)
     static float env_f(const char* k, float d) { return std::getenv(k) ? (float) std::atof(std::getenv(k)) : d; }
@@ -1373,6 +1397,8 @@ struct Model::Impl {
         std::fflush(dump_l);
     }
 
+    std::unique_ptr<DemandPrepare> demand_prepare; // opt-in; drained within every CPU call
+    bool demand_reported = false; // first completed batch, also visible before model shutdown
     bool dump_s_on(int il) const {
         if (dump_s == nullptr) return false;
         for (int x : dump_s_layers)
@@ -1419,6 +1445,21 @@ struct Model::Impl {
             }
         quit.store(true);
         if (service.joinable()) service.join();
+        if (router_gemv_static_batch)
+            std::fprintf(stderr, "ds4 router static batch: requested=1 owner_async=%llu groups3=%llu groups2=0 groups1=0 t1=%llu t2=%llu t3=%llu t4=%llu fallback_shape=%llu fallback_ahead=%llu fallback_near=%llu scope=model_lifetime_serial_single_gpu_async submitted_only=1 kernel_completion_certified=0\n",
+                         (unsigned long long) router_owner_async, (unsigned long long) router_groups3,
+                         (unsigned long long) router_t3[0], (unsigned long long) router_t3[1],
+                         (unsigned long long) router_t3[2], (unsigned long long) router_t3[3],
+                         (unsigned long long) router_fallback_shape, (unsigned long long) router_fallback_ahead,
+                         (unsigned long long) router_fallback_near);
+
+        if (demand_prepare) {
+            const auto ds = demand_prepare->stats();
+            std::fprintf(stderr, "ds4 demand pipeline: batches %llu ranges %llu cancelled %llu prepare_ms %.3f tail_ms %.3f (overlapping wall times)\n",
+                         (unsigned long long)ds.batches, (unsigned long long)ds.ranges,
+                         (unsigned long long)ds.cancelled, ds.prepare_ns / 1e6, ds.tail_ns / 1e6);
+            demand_prepare.reset();
+        }
         if (store_bg.joinable()) store_bg.join();   // (the store's background fill: it checks quit between its pieces)
         {
             std::lock_guard<std::mutex> lk(pf_mu);
@@ -2097,6 +2138,21 @@ struct Model::Impl {
                   std::to_string(g.ix_hd) + ", experts per token " + std::to_string(g.k_exp) + ")";
             return false;
         }
+        // ATOMIC_CONTEXT_CAPACITY_BEGIN
+        // Explicit real-model capacity audit, before CUDA contexts or large allocations.
+        // Math, cache layout, compression and YOCO policy are unchanged when enabled.
+        if (context_capacity::requested(std::getenv("DS4_CONTEXT_CAPACITY_CHECK"))) {
+            context_capacity::Plan capacity;
+            if (!context_capacity::make((int64_t) pk.num("max_position_embeddings", 0), o.max_context, g.nl, g.hd, g.ix_hd,
+                                        g.cand_blk, o.prefill_chunk > 0, g.ratios, g.kv_src, capacity, err))
+                return false;
+            std::fprintf(stderr, "ds4 context capacity: requested=1 metadata_max=%llu context=%llu source_rows=%llu largest_source_rows=%llu source_cache_bytes=%llu decode_score_bytes=%llu prefill_score_bytes=%llu index_slab_rows=%d accounting=partial_single_device completion_certified=0\n",
+                         (unsigned long long) capacity.max_positions, (unsigned long long) capacity.context,
+                         (unsigned long long) capacity.source_rows, (unsigned long long) capacity.largest_source_rows,
+                         (unsigned long long) capacity.source_cache_bytes, (unsigned long long) capacity.decode_score_bytes,
+                         (unsigned long long) capacity.prefill_score_bytes, capacity.index_slab_rows);
+        }
+        // ATOMIC_CONTEXT_CAPACITY_END
         freqs_win = rope_freqs(g.rd, 0, g.rope_theta, g.factor, g.beta_fast, g.beta_slow);
         freqs_comp = rope_freqs(g.rd, g.orig_ctx, g.comp_theta, g.factor, g.beta_fast, g.beta_slow);
 
@@ -2114,6 +2170,17 @@ struct Model::Impl {
             Dev& d = devs[i];
             d.id = ids[i];
             CK(cudaSetDevice(d.id));
+#if defined(__CUDACC__) && !defined(__HIPCC__) && !defined(STRATA_USE_HIP) && !defined(__HIP_PLATFORM_AMD__)
+            // Per-context host wait policy only; preserve the existing default and non-scheduling flags.
+            if (const char* wait = std::getenv("DS4_CUDA_BLOCKING_SYNC"); wait && std::atoi(wait) != 0) {
+                unsigned flags = 0;
+                CK(cudaGetDeviceFlags(&flags));
+                // MapHost is implicit in the runtime API, not a settable flag in its contract.
+                flags = (flags & ~(cudaDeviceScheduleMask | cudaDeviceMapHost)) | cudaDeviceScheduleBlockingSync;
+                CK(cudaSetDeviceFlags(flags));
+                if (o.verbose) std::fprintf(stderr, "ds4: CUDA%d host waits use blocking synchronization\n", d.id);
+            }
+#endif
             CK(cudaStreamCreateWithFlags(&d.st, cudaStreamNonBlocking));
             CK(cudaEventCreateWithFlags(&d.ev, cudaEventDisableTiming));
             CK(cudaEventCreateWithFlags(&d.ev2, cudaEventDisableTiming));
@@ -2239,15 +2306,37 @@ struct Model::Impl {
                          kWin, o.prefill_chunk == 0 ? "--prefill-chunk 0" : "--tp 1 with --threads off", kVlRows,
                          o.prefill_chunk == 0 ? "leave --prefill-chunk out for chunks"
                                               : "leave --tp 1 out, or pass --threads on, for chunks");
+        // Atomic multimodal validation is explicit: never call a text-only fallback vision success.
+        vision_required = vision_contract::required(std::getenv("DS4_REQUIRE_VISION"));
+        if (vision_required && !o.vision) {
+            err = "DS4_REQUIRE_VISION=1 conflicts with --vision off";
+            return false;
+        }
+        if (vision_required && !o.vision_only) {
+            for (int il = 0; il < g.nl; ++il) {
+                const std::string name = "layers." + std::to_string(il) + ".ffn.gate.bias_vl";
+                const Tensor* t = pk.get(name);
+                if (!vision_contract::bias_layout(t != nullptr, t != nullptr && t->dtype == "F32",
+                                                   t != nullptr ? t->bytes : 0, t != nullptr ? t->shape.size() : 0,
+                                                   t != nullptr && !t->shape.empty() ? t->shape[0] : 0, g.n_exp)) {
+                    err = name + ": required original image routing bias is missing or not F32 [n_experts]";
+                    return false;
+                }
+            }
+        }
         // the vision tower on the first GPU, before the split: the layers get what it leaves
         if (o.vision && !load_vision(err)) {   // (a tower that cannot load leaves the model reading text: said loudly,
-            if (o.vision_only) return false;   // and the server is told pictures are off - info_lines)
+            if (o.vision_only || vision_required) return false;   // strict image operation never degrades to text
             std::fprintf(stderr, "ds4: WARNING: the vision tower did not load (%s): pictures are OFF, the model reads "
                                  "text only\n", err.c_str());
             vision_err = err.empty() ? "unknown reason" : err;
             err.clear();
             vt.release();
             img_tok = -1;
+        }
+        if (vision_required && (img_tok < 0 || img_tok >= g.vocab)) {
+            err = "DS4_REQUIRE_VISION=1: the pack has no usable original vision tower/image token";
+            return false;
         }
         if (o.vision_only) return true;
 
@@ -2609,6 +2698,14 @@ struct Model::Impl {
             if (g.n_mtp > 0 && (int) di == head_dev &&
                 (!dalloc(d, d_confv, kWin, err) || !dalloc(d, d_ints, 64, err) || !dalloc(d, d_specq, kWin, err)))
                 return false;
+            if (g.n_mtp > 0 && (int) di == head_dev) {
+                if (sample_drafts && !dalloc(d, d_spec_full, (size_t) kWin * (size_t) g.vocab, err)) return false;
+                for (int i=0;i<kWin;++i) {
+                    h_specq[(size_t)i].full=d_spec_full?d_spec_full+(size_t)i*g.vocab:nullptr;
+                    h_specq[(size_t)i].capacity=d_spec_full?g.vocab:0;
+                }
+                CK(cudaMemcpy(d_specq,h_specq.data(),(size_t)kWin*sizeof(strata::dsv41k::SpecList),cudaMemcpyHostToDevice));
+            }
             CK(cudaEventCreateWithFlags(&d.ev_out, cudaEventDisableTiming));
             cudaSetDevice(d.id);
             CK(cudaMemcpy(d.freqs_win, freqs_win.data(), freqs_win.size() * 4, cudaMemcpyHostToDevice));
@@ -2670,6 +2767,28 @@ struct Model::Impl {
             CK(cudaSetDevice(devs[(size_t) d_dev].id));
             CK(cudaEventCreateWithFlags(&ev_seed, cudaEventDisableTiming));
             CK(cudaEventRecord(ev_seed, devs[(size_t) d_dev].st));
+            // Bound the optional allocation to the current pack. Prefill and dumps keep their host taps.
+            if (device_taps_requested && !kHipBuild && devs.size() == 1 && !par && tp == 1 &&
+                d_dev == 0 && head_dev == 0 && dump_d == nullptr && dump_h == nullptr &&
+                g.dim == 5120 && g.d_targets.size() == 3) {
+                Dev& d = devs[0];
+                void* v = nullptr;
+                const size_t bytes = (size_t) kWin * 3 * 5120 * sizeof(float);
+                const cudaError_t rc = cudaMalloc(&v, bytes);
+                if (rc == cudaSuccess) {
+                    d_decode_taps = (float*) v;
+                    d.allocs.push_back(v);
+                    d.scratch += bytes;
+                } else if (rc == cudaErrorMemoryAllocation) {
+                    (void) cudaGetLastError();   // optional scratch unavailable: use the host path
+                } else {
+                    CK(rc);
+                }
+            }
+            if (o.verbose && device_taps_requested)
+                std::fprintf(stderr, "ds4: device taps requested=1 active=%d bytes=%zu decode_only=1\n",
+                             d_decode_taps != nullptr ? 1 : 0,
+                             d_decode_taps != nullptr ? (size_t) kWin * 3 * 5120 * sizeof(float) : 0);
         }
         // the dense weights, each device's layers by a thread of its own
         {
@@ -2707,6 +2826,16 @@ struct Model::Impl {
             }
             devs[(size_t) head_dev].mk_ints = d_ints;   // (the lead's drafted tokens: where the confidence head reads them)
             mk_split = true;
+        }
+        if (o.verbose && g.n_mtp > 0) {
+            const int override_q8 = env_tri("DS4_MARKOV_HEAD_Q8");
+            const bool v026 = defaults_026();
+            const char* whole = d_mk_head_q8 != nullptr ? "Q8_0" : "F16";
+            std::fprintf(stderr,
+                         "ds4: draft markov-head whole=%s greedy=%s sampled=%s source=%s DS4_MARKOV_HEAD_Q8=%s defaults=%s\n",
+                         whole, mk_split ? "F16-split" : whole, whole,
+                         override_q8 < 0 ? "release-default" : "explicit-override",
+                         override_q8 < 0 ? "unset" : override_q8 ? "1" : "0", v026 ? "026" : "027");
         }
 
         // the embedding table, pinned on the host
@@ -4219,7 +4348,7 @@ struct Model::Impl {
                     return false;
                 }
                 if (!dalloc(d, d_mk_embed, te->bytes / 2, err, acct) || !upload(d, *te, d_mk_embed, err) ||
-                    (strata::ds4::markov_head_q8_default(defaults_026())
+                    (strata::ds4::markov_head_q8_value(env_tri("DS4_MARKOV_HEAD_Q8"), defaults_026())
                          ? !mk_head_q8(d, Z + "markov_head.head.weight", d_mk_head_q8, err, acct)
                          : !f16raw(d, Z + "markov_head.head.weight", d_mk_head, err, acct)))   // (0.2.6: the head as F16)
                     return false;
@@ -4607,6 +4736,9 @@ struct Model::Impl {
     // a GGUF's VRAM experts, in file order, by a few threads through pinned staging blobs (the CPU lane's stay in the
     // file: the mapping reads them on first use)
     bool load_experts_mx(std::string& err) {
+        const char* direct_env=std::getenv("DS4_LOAD_DIRECT_COLD");
+        const bool direct_cold=direct_env && std::atoi(direct_env)!=0;
+        std::atomic<uint64_t> direct_bytes{0},buffered_bytes{0},direct_ranges{0};
         struct Job {
             int layer, e;
         };
@@ -4639,7 +4771,20 @@ struct Model::Impl {
                     if (i >= jobs.size() || failed.load()) break;
                     const Layer& l = L[(size_t) jobs[i].layer];
                     const int e = jobs[i].e;
-                    bool ok = stage != nullptr && stage2 != nullptr && read_mx(l, e, stage);
+                    bool ok=stage!=nullptr && stage2!=nullptr;
+                    bool eligible=direct_cold && l.nm==1 && (l.ram.empty() || l.ram[(size_t)e]<0);
+                    if(eligible)for(int r=0;r<3;++r)
+                        eligible=eligible && (size_t)l.mx_file[r]<pk.pfds.size() && pk.pfds[(size_t)l.mx_file[r]]!=os::kBadFd;
+                    if(ok && eligible){
+                        for(int r=0;r<3 && ok;++r){
+                            const auto file=(size_t)l.mx_file[r];const auto n=mx_part_bytes(l,r);
+                            const auto off=l.mx_off[r]+(uint64_t)e*l.mx_stride[r];bool used=false;
+                            ok=os::pread_cached_or_direct(pk.pfds[file],file<pk.dfds.size()?pk.dfds[file]:os::kBadFd,
+                                mx_mat(l,e,r),stage+l.lay.trellis[r],stage2,maxb,n,off,used);
+                            (used?direct_bytes:buffered_bytes).fetch_add(n,std::memory_order_relaxed);
+                            if(used)direct_ranges.fetch_add(1,std::memory_order_relaxed);
+                        }
+                    }else if(ok)ok=read_mx(l,e,stage);
                     for (int m = 0; m < l.nm && ok; ++m) {   // (a group: each member its part)
                         const Layer& x = member(l, m);
                         cudaSetDevice(devs[(size_t) x.dev].id);
@@ -4662,6 +4807,8 @@ struct Model::Impl {
                 if (stage2) cudaFreeHost(stage2);
             });
         for (auto& t : th) t.join();
+        if(direct_cold)std::fprintf(stderr,"ds4 startup-direct-cold direct_bytes=%llu buffered_bytes=%llu direct_ranges=%llu\n",
+            (unsigned long long)direct_bytes.load(),(unsigned long long)buffered_bytes.load(),(unsigned long long)direct_ranges.load());
         if (failed.load()) {
             err = ferr;
             return false;
@@ -4698,6 +4845,12 @@ struct Model::Impl {
                 const uint64_t av = ram_avail();
                 if (av != ~uint64_t{0}) warm_bytes = av > kRamMargin ? std::min<uint64_t>(warm_bytes, av - kRamMargin) : 0;
             }
+        }
+        const char* warm_room = std::getenv("DS4_WARM_ROOM");
+        if (file_experts && !ram_tier && warm_room && std::atoi(warm_room) != 0) {
+            const uint64_t before = warm_bytes, av = ram_avail();
+            warm_bytes = os::warm_limit(warm_bytes, av, kRamMargin);
+            std::fprintf(stderr, "ds4: post-allocation CPU warm budget %.1f -> %.1f GB\n", before / 1e9, warm_bytes / 1e9);
         }
         if (ram_tier && warm_bytes > 0 && !warm.empty()) {
             // chunks of 32 slots up to warm_bytes (all the RAM the rest leaves, kRamMargin kept), one slot kept free for
@@ -4747,14 +4900,42 @@ struct Model::Impl {
         size_t nw = 0;
         for (double b = 0; nw < warm.size() && b + (double) L[(size_t) warm[nw].layer].blob <= (double) warm_bytes; ++nw)
             b += (double) L[(size_t) warm[nw].layer].blob;
+        // Only the discard-only page-cache warmup may skip a read. GPU uploads and RAM copies above still read all bytes.
+        const char* skip_env = std::getenv("DS4_LOAD_SKIP_WARM_CACHED");
+        const bool skip_warm_cached = file_experts && !copy_mode && skip_env && std::atoi(skip_env) != 0;
+        const char* warm_stats_env = std::getenv("DS4_LOAD_WARM_STATS");
+        const bool warm_stats = skip_warm_cached || (warm_stats_env && std::atoi(warm_stats_env) != 0);
+        const double warm_t0 = warm_stats ? now_ms() : 0;
+        std::atomic<uint64_t> warm_skipped_bytes{0};
+        std::atomic<size_t> warm_skipped_jobs{0};
         std::atomic<size_t> wi{0};
         std::vector<std::thread> wt;
         for (int t = 0; t < 12 && nw > 0; ++t)
             wt.emplace_back([&] {
                 std::vector<uint8_t> buf(maxb);
-                for (size_t i; (i = wi.fetch_add(1)) < nw;) read_mx(L[(size_t) warm[i].layer], warm[i].e, buf.data());
+                uint64_t skipped_bytes = 0;
+                size_t skipped_jobs = 0;
+                for (size_t i; (i = wi.fetch_add(1)) < nw;) {
+                    const Layer& l = L[(size_t) warm[i].layer];
+                    const int e = warm[i].e;
+                    bool cached = skip_warm_cached;
+                    for (int r = 0; r < 3 && cached; ++r)
+                        cached = os::resident(pk.at(l.mx_file[r], l.mx_off[r] + (uint64_t) e * l.mx_stride[r]),
+                                              mx_part_bytes(l, r));
+                    if (cached) {
+                        ++skipped_jobs;
+                        for (int r = 0; r < 3; ++r) skipped_bytes += mx_part_bytes(l, r);
+                    } else {
+                        read_mx(l, e, buf.data());
+                    }
+                }
+                if (warm_stats) { warm_skipped_bytes.fetch_add(skipped_bytes); warm_skipped_jobs.fetch_add(skipped_jobs); }
             });
         for (auto& t : wt) t.join();
+        if (warm_stats)
+            std::fprintf(stderr, "ds4: warm-only skip_cached=%d jobs=%zu skipped=%zu skipped_bytes=%llu wall_ms=%.3f\n",
+                         skip_warm_cached ? 1 : 0, nw, warm_skipped_jobs.load(),
+                         (unsigned long long) warm_skipped_bytes.load(), now_ms() - warm_t0);
         if (o.verbose && nw > 0)
             std::fprintf(stderr, "ds4: %zu CPU-lane experts read ahead (%.1f GB) in %.1f s\n", nw,
                          nw * (double) L[0].blob / 1e9, (now_ms() - t0) / 1000.0);
@@ -5463,7 +5644,9 @@ struct Model::Impl {
                 c.resize(c.size() - (size_t) lane_free);
             int nw = (int) c.size();
             if (o.cpu_threads > 0) nw = std::max(X == 0 ? 0 : 1, std::min(nw, o.cpu_threads / NH - (X == 0 ? 1 : 0)));
-            pools.push_back(std::make_unique<Pool>(nw, c, 20000));   // spin through a token's layers (20 ms)
+            const char* spin = std::getenv("DS4_LANE_SPIN_US");
+            const int spin_us = spin ? std::max(0, std::min(20000, std::atoi(spin))) : 20000;
+            pools.push_back(std::make_unique<Pool>(nw, c, spin_us));   // default: spin through a token's layers (20 ms)
         }
         (void) gg::mx_tier();   // (measured here, not on the first token)
         if (o.verbose) {
@@ -5953,6 +6136,8 @@ struct Model::Impl {
     VisionTower vt;
     VisionGeo vg;
     int img_tok = -1;
+    bool vision_required = false;
+    uint64_t vision_encode_reported = 0;
     std::string vision_err;              // why the tower did not load (pictures off), or empty
     std::vector<uint16_t> img_mark[3];   // image_start, image_newline, image_end: BF16 [dim]
     std::vector<Image> imgs;             // the pictures of the prompt being fed, by start
@@ -5978,6 +6163,11 @@ struct Model::Impl {
         vg.inter = (int) pk.num("vision.intermediate_size", 2816), vg.patch = (int) pk.num("vision.patch_size", 14);
         vg.merge = (int) pk.num("vision.downsample_ratio", 3), vg.theta = (float) pk.num("vision.rope_theta", 1e4);
         vg.max_tokens = (int) pk.num("vision.max_image_tokens", 1024), vg.out = g.dim;
+        if (vision_required && (vg.dim <= 0 || vg.heads <= 0 || vg.dim % vg.heads != 0 || vg.inter <= 0 ||
+                                vg.patch <= 0 || vg.merge <= 0 || vg.max_tokens < 4 || tok >= g.vocab)) {
+            err = "required vision geometry/image token is invalid";
+            return false;
+        }
         const char* mark[3] = {"image_start", "image_newline", "image_end"};
         for (int i = 0; i < 3; ++i) {
             const Tensor* t = pk.get(mark[i]);
@@ -6040,6 +6230,12 @@ struct Model::Impl {
             put(img_mark[1].data());
         }
         put(img_mark[2].data());
+        if (vision_required && vision_encode_reported < 16) {
+            ++vision_encode_reported;
+            std::fprintf(stderr, "ds4 vision encode: completed=1 call=%llu width=%d height=%d span_rows=%zu "
+                                 "output_dim=%d scope=model_lifetime sample_limit=16\n",
+                         (unsigned long long) vision_encode_reported, w, h, span.size() / D, g.dim);
+        }
         return true;
     }
     // the row of a picture's span at position p (null: p is in none)
@@ -6429,7 +6625,10 @@ struct Model::Impl {
     }
 #endif
     void cpu_experts_iq(const Layer& l, const float* x, const std::vector<Ent>& ents, size_t ldx, const int* ord) {
-        constexpr int RB = 64;   // rows a job
+        static const int RB = [] {   // rows a job; opt-in finer scheduling on asymmetric CPUs
+            const char* v = std::getenv("DS4_IQ_JOB_ROWS");
+            return v ? std::max(8, std::min(256, std::atoi(v))) : 64;
+        }();
         const int E = g.dim, FF = g.ff, FFh = FF / NH, Eh = E / NH;
         const int GB = (FFh + RB - 1) / RB, DB = (Eh + RB - 1) / RB, ne = (int) ents.size();
         gg::IqCpu fm;
@@ -6447,6 +6646,7 @@ struct Model::Impl {
         if (cpulog) ++n_calls;
         double tp0 = now_ms();
         const float lim = g.lim;
+#if defined(__APPLE__)
         {   // (os::prefetch_cold, as above: the resident ones are left alone - on Windows the hint walks every page of a
             // range, ~0.13 ms an IQ2_XXS expert, on the lane's critical path before the first entry computes.
             // off by default (the mmap path, owner PC: not faster in every pair); DS4_IQ_PF_COLD=1 turns it on)
@@ -6484,6 +6684,44 @@ struct Model::Impl {
             else os::prefetch_cold(want);
 #endif
         }
+        std::optional<DemandPrepare::Ticket> demand_ticket;
+#else
+        // Existing predicted lookahead stays unchanged. This worker handles only this call's
+        // confirmed mmap demand, concurrently with activation prep and CPU rows. No new cache.
+        std::vector<DemandPrepare::Range> want;
+        for (const Ent& en : ents)
+            if (!store && (l.ram.empty() || l.ram[(size_t) en.e] < 0))
+                for (int r = 0; r < 3; ++r) want.push_back({mx_mat(l, en.e, r), mx_part_bytes(l, r)});
+        static const bool pf_all = std::getenv("DS4_IQ_PF_COLD") == nullptr || std::atoi(std::getenv("DS4_IQ_PF_COLD")) == 0;
+        static const size_t demand_chunk = [] {
+            const char* v = std::getenv("DS4_IQ_PREFETCH_KB");
+            return v ? (size_t)std::max(0, std::min(4096, std::atoi(v))) * 1024 : 0;
+        }();
+        static const bool pipeline = [] {
+            const char* v = std::getenv("DS4_CPU_DEMAND_PIPELINE");
+            return v && std::atoi(v) != 0;
+        }();
+        auto prepare = [](const std::vector<DemandPrepare::Range>& ranges) {
+            if (demand_chunk) os::prefetch_chunked(ranges, demand_chunk);
+            else if (pf_all) os::prefetch(ranges);
+            else os::prefetch_cold(ranges);
+        };
+        if (pipeline && !want.empty() && !demand_prepare) {
+            try {
+                demand_prepare.reset(new DemandPrepare([prepare, one = std::vector<DemandPrepare::Range>(1)](const DemandPrepare::Range& r) mutable {
+                    one[0] = r;
+                    prepare(one);
+                }));
+                std::fprintf(stderr, "ds4: confirmed CPU demand pipeline enabled (one preparation worker)\n");
+            } catch (const std::system_error&) {
+                // A system without an available worker keeps the synchronous path.
+            }
+        }
+        std::optional<DemandPrepare::Ticket> demand_ticket;
+        if (pipeline && !want.empty() && demand_prepare)
+            demand_ticket.emplace(demand_prepare->start(std::move(want)));
+        else prepare(want);
+#endif
         double tp1 = now_ms(); if (cpulog) t_pre += tp1 - tp0;
         // the activations in c_xh's bytes, E 4 apart: token t's (t < kWin) at row t - quantized once, whatever number of
         // entries take it - then a row a slot (kWin + slot): a token past the window's input (none on the decode or
@@ -6540,6 +6778,17 @@ struct Model::Impl {
                 gg::iq_cpu_down(fm, mx_part_ptr(l, en.e, 2, X), hp, en.n, yp, r0 - X * Eh, r1 - X * Eh);
             };
         run_nodes(ne * DB, f);
+        if (demand_ticket) {
+            demand_ticket->finish(); // drain before mapping ownership can change
+            if (!demand_reported) {
+                const auto ds = demand_prepare->stats();
+                std::fprintf(stderr, "ds4 demand pipeline completed: layer=%d entries=%d rb=%d shards=%d gate_jobs_per_shard=%d down_jobs_per_shard=%d batches=%llu ranges=%llu cancelled=%llu prepare_ms=%.3f tail_ms=%.3f (overlapping wall times)\n",
+                             l.il, ne, RB, NH, ne * GB, ne * DB,
+                             (unsigned long long)ds.batches, (unsigned long long)ds.ranges,
+                             (unsigned long long)ds.cancelled, ds.prepare_ns / 1e6, ds.tail_ns / 1e6);
+                demand_reported = true;
+            }
+        }
         if (cpulog) t_r2 += now_ms() - tq2;
         {   // DS4_PROF: where the CPU lane's time goes (act prep + prefetch, gate/up, h quant, down), summed
             static const bool on = std::getenv("DS4_PROF") != nullptr;
@@ -7083,7 +7332,11 @@ struct Model::Impl {
                 for (float& h : l.heat) h *= c_decay;
         }
         bool queued = false, rqueued = false;
-        for (Layer& l : L) {
+        // Start after the last accepted promotion so a full queue cannot always favor the first layers.
+        const size_t scan_begin = cache_scan.begin(L.size(), c_round_robin);
+        for (size_t i = 0; i < L.size(); ++i) {
+            const size_t li = CacheScan::layer(scan_begin, i, L.size());
+            Layer& l = L[li];
             if (l.cpu_hits.empty()) continue;
             std::vector<int> hits;
             hits.swap(l.cpu_hits);
@@ -7102,6 +7355,7 @@ struct Model::Impl {
                     if (copy_mode && l.ram[(size_t) best] >= 0) sw.ram = copy_spare[(size_t) l.il];   // (-1: none)
                     std::lock_guard<std::mutex> lk(sw_mu);
                     sw_queue.push_back(sw);
+                    cache_scan.queued(li, L.size(), c_round_robin);
                     queued = true;
                 }
             }
@@ -7134,6 +7388,10 @@ struct Model::Impl {
 
     // lookahead's thread: the ranges the CPU lane asked for, read in (os::prefetch) off the lane, which computes
     void prefetch_loop() {
+        const char* pop=std::getenv("DS4_AHEAD_POPULATE_WARM");
+        const bool populate=pop && std::atoi(pop)!=0;
+        const char* wo=std::getenv("DS4_AHEAD_WARM_ONLY");
+        const bool cold_hint=!(wo && std::atoi(wo)!=0);
         std::vector<std::pair<const void*, size_t>> b;
         for (;;) {
             {
@@ -7142,7 +7400,8 @@ struct Model::Impl {
                 if (quit.load(std::memory_order_relaxed)) return;
                 b.swap(pf_q);
             }
-            os::prefetch_cold(b);   // (the resident ones would only cost the page walk)
+            if(populate)os::prefetch_populate_cached(b,cold_hint);
+            else os::prefetch_cold(b);   // original background path, including its default
             b.clear();
         }
     }
@@ -7204,6 +7463,9 @@ struct Model::Impl {
     // the decode path's host side: each published routing in turn - its CPU lane experts (if any) into the answer's
     // part, then the answer's seq.  Spins while requests come (a token's 40 layers), naps after 2 ms without one.
     void serve_lane() {
+        const char* spin = std::getenv("DS4_SERVICE_SPIN_US");
+        const int spin_us = spin ? std::max(0, std::min(20000, std::atoi(spin))) : 2000;
+        if (spin && o.verbose) std::fprintf(stderr, "ds4: CPU service idle spin %d us\n", spin_us);
         unsigned next = 1;
         auto last = std::chrono::steady_clock::now();
         std::vector<Ent> ents;
@@ -7211,7 +7473,7 @@ struct Model::Impl {
             Req& r = reqs[next % kRing];
             if (*(volatile unsigned*) &r.seq != next) {
                 cpu_relax();
-                if (std::chrono::steady_clock::now() - last > std::chrono::milliseconds(2))
+                if (std::chrono::steady_clock::now() - last > std::chrono::microseconds(spin_us))
                     std::this_thread::sleep_for(std::chrono::microseconds(20));
                 continue;
             }
@@ -7411,7 +7673,9 @@ struct Model::Impl {
     // and each block's wkv / kv_norm / rope / FP8, for the positions the trunk kept.  draft() runs the block [y, noise x
     // (block - 1)] at positions pos .. through the blocks (each query attending to the ring and to the whole block),
     // the trunk's head, the markov bias token by token (greedy) and the confidence head.
-    bool seed_drafter(int64_t p0, int n, int row0, std::string& err) {
+    // The device pointer is call-local, produced by this forward's taps before any seeding.
+    // Same-stream main_proj consumes it before the next decode can overwrite it.
+    bool seed_drafter(int64_t p0, int n, int row0, std::string& err, const float* device_taps = nullptr) {
         if (g.n_mtp == 0 || n <= 0) return true;
         if (n > kWin * kPicks) {
             err = "seeding the drafter with " + std::to_string(n) + " rows";
@@ -7433,9 +7697,14 @@ struct Model::Impl {
         }
         for (int a = 0; a < n; a += kWin) {   // (a chunk's last 128 rows: 16 a GEMV)
             const int na = std::min(kWin, n - a);
-            CK(cudaMemcpyAsync(d.xe, h_taps + (size_t) (row0 + a) * nt * D, (size_t) na * nt * D * 4,
-                               cudaMemcpyHostToDevice, d.st));
-            if (!mv(d, {job(d_main_proj, d.xe, d.ed + (size_t) a * D, na, (size_t) nt * D, D)}, err)) return false;
+            const float* taps = d.xe;
+            if (device_taps != nullptr) {
+                taps = device_taps + (size_t) (row0 + a) * nt * D;
+            } else {
+                CK(cudaMemcpyAsync(d.xe, h_taps + (size_t) (row0 + a) * nt * D, (size_t) na * nt * D * 4,
+                                   cudaMemcpyHostToDevice, d.st));
+            }
+            if (!mv(d, {job(d_main_proj, taps, d.ed + (size_t) a * D, na, (size_t) nt * D, D)}, err)) return false;
         }
         CK(cudaEventRecord(ev_seed, d.st));
         Finish fm;
@@ -7606,12 +7875,18 @@ struct Model::Impl {
                 sp.min_p = dq_min_p;
                 sp.seed = dq_seed;
             }
+            std::unique_ptr<Grammar> draft_grammar=(drafts_q && grammar)?std::make_unique<Grammar>(*grammar):nullptr;
             for (int i = 0; i < T; ++i) {   // the markov bias of the token before, then that position's draft
                 if (d_mk_head_q8 != nullptr) markov_add_q8(hd.logits + (size_t) i * V, d_mk_embed, d_mk_head_q8, d_ints + i, V, R, hd.st);
                 else markov_add(hd.logits + (size_t) i * V, d_mk_embed, d_mk_head, d_ints + i, V, R, hd.st);
                 if (drafts_q) {
+                    std::vector<uint8_t> mask;
+                    if(draft_grammar){mask=draft_grammar->allowed("draft");sp.host_allowed=&mask;}
                     sp.counter = dq_counter + (uint64_t) i;
                     strata::dsv41k::sample_draft(hd.logits + (size_t) i * V, 1, V, sp, d_specq + i, d_ints + i + 1, hd.st);
+                    if(draft_grammar){int dt=-1;CK(cudaMemcpyAsync(&dt,d_ints+i+1,4,cudaMemcpyDeviceToHost,hd.st));CK(cudaStreamSynchronize(hd.st));
+                        if(!draft_grammar->accept(dt)){err="sampled draft violated grammar";return false;}}
+                    sp.host_allowed=nullptr;
                 } else
                     strata::dsv41k::sample_tokens(hd.logits + (size_t) i * V, 1, V, nullptr, 0, sp, d_ints + i + 1, hd.st);
             }
@@ -7664,6 +7939,8 @@ struct Model::Impl {
         sp.seed = seed;
         sp.counter = counter;
         sp.logit_bias = bias;
+        std::vector<uint8_t> mask;
+        if (grammar) { mask=grammar->allowed("target"); sp.host_allowed=&mask; }
         strata::dsv41k::sample_tokens(d.logits + (size_t) row * g.vocab, 1, g.vocab, nullptr, 0, sp, d.tok, d.st);
         int t = -1;
 #if defined(STRATA_METAL)
@@ -7671,6 +7948,7 @@ struct Model::Impl {
 #endif
         cudaMemcpyAsync(&t, d.tok, 4, cudaMemcpyDeviceToHost, d.st);
         cudaStreamSynchronize(d.st);
+        if (grammar && !grammar->accept(t)) throw std::runtime_error("sample violated native grammar");
         return t;
     }
 
@@ -7689,14 +7967,41 @@ struct Model::Impl {
         for (int i = 0; i < n; ++i) tk[i + 1] = drafts[(size_t) i];
         spec_win = true;
         const double tv = now_ms();
-        const bool ok = forward(tk, T, T, err, 0);
+        float* const taps = decode_taps(T);
+        const bool ok = forward(tk, T, T, err, 0, taps);
         st.verify_ms += now_ms() - tv;
         spec_win = false;
         if (!ok) return false;
         Dev& hd = devs[(size_t) head_dev];
         cudaSetDevice(hd.id);
         int m = 0;
-        if (temperature <= 0.0f) {
+        if (grammar) {
+            Grammar state=*grammar;
+            const bool own=drafts_q && dq_temp==temperature && dq_top_p==top_p && dq_top_k==top_k &&
+                           dq_min_p==min_p && dq_seed==seed && dq_counter==counter;
+            if (temperature>0 && !own) {
+                for(int i=0;i<n;++i) {h_specq[(size_t)i].n=1;h_specq[(size_t)i].ids[0]=drafts[(size_t)i];h_specq[(size_t)i].p[0]=1;}
+                CK(cudaMemcpyAsync(d_specq,h_specq.data(),(size_t)n*sizeof(strata::dsv41k::SpecList),cudaMemcpyHostToDevice,hd.st));
+            }
+            for(int i=0;i<n;++i)h_idx[i]=drafts[(size_t)i];
+            CK(cudaMemcpyAsync(d_ints+32,h_idx,(size_t)n*4,cudaMemcpyHostToDevice,hd.st));
+            for(int i=0;i<=n;++i) {
+                strata::dsv41k::SamplerParams sp;
+                sp.temperature=temperature;sp.greedy=temperature<=0;sp.top_p=top_p;sp.top_k=top_k;
+                sp.min_p=min_p;sp.seed=seed;sp.counter=counter+(uint64_t)i;
+                auto mask=state.allowed("verify");sp.host_allowed=&mask;
+                if(temperature>0 && i<n)
+                    strata::dsv41k::sample_verify(hd.logits+(size_t)i*V,1,V,sp,d_specq+i,d_ints+32+i,d_ints+16,hd.st);
+                else strata::dsv41k::sample_tokens(hd.logits+(size_t)i*V,1,V,nullptr,0,sp,d_ints+16,hd.st);
+                int pick=-1;
+                CK(cudaMemcpyAsync(&pick,d_ints+16,4,cudaMemcpyDeviceToHost,hd.st));
+                CK(cudaStreamSynchronize(hd.st));
+                if(!state.accept(pick)){err="verify violated native grammar";return false;}
+                if(i<n && pick==drafts[(size_t)i]) {++m;continue;}
+                next=pick;break;
+            }
+            *grammar=std::move(state);
+        } else if (temperature <= 0.0f) {
             strata::dsv41k::SamplerParams sp;
             sp.greedy = true;
             sp.temperature = 0.0f;
@@ -7745,7 +8050,7 @@ struct Model::Impl {
         }
         drafts_q = false;
         rollback(p0, T, m + 1);
-        if (!seed_drafter(p0, m + 1, 0, err)) return false;
+        if (!seed_drafter(p0, m + 1, 0, err, taps)) return false;
         accepted = m;
         st.drafts_offered += n;
         st.drafts_accepted += m;
@@ -7800,7 +8105,14 @@ struct Model::Impl {
     }
 
     // ---- a window: T tokens at positions pos .. pos + T - 1 through every layer; the logits of its last `logits` rows
-    bool step(int token, bool want_logits, std::string& err) { return forward(&token, 1, want_logits ? 1 : 0, err); }
+    float* decode_taps(int T) const {
+        return T >= 1 && T <= kWin && !kHipBuild && devs.size() == 1 && !par && !L.empty() && L[0].nm == 1 &&
+                       dump_d == nullptr && dump_h == nullptr ? d_decode_taps : nullptr;
+    }
+
+    bool step(int token, bool want_logits, std::string& err) {
+        return forward(&token, 1, want_logits ? 1 : 0, err, -1, decode_taps(1));
+    }
 
 
     // layer L0 for a chunk of T tokens at p0 as group member mi: layer()'s arithmetic over the chunk's rows (the
@@ -9244,6 +9556,15 @@ struct Model::Impl {
         if (logits_all) n_logits = (T_last - 1) % kWin + 1;   // (sample() takes the last row of d.logits)
         pos += n;
         st.tokens += n;
+        if (const char* cap = std::getenv("DS4_PROMPT_HEAT_CAP")) {
+            const char* tr = std::getenv("DS4_PROMPT_HEAT_TRIGGER");
+            const double trigger = tr ? std::max(1.0, std::atof(tr)) : 1.0;
+            int changed = 0;
+            for (Layer& l : L)
+                if (!l.mtp && bound_heat(l.heat, std::atof(cap), trigger)) ++changed;
+            if (o.verbose && changed)
+                std::fprintf(stderr, "ds4: prompt cache heat bounded on %d layers to %s\n", changed, cap);
+        }
         cache_tick(n);
         if (lm_end_.on) {   // (the layer cache's RAM back before the store and the swaps want it)
             lm_end();
@@ -9398,12 +9719,17 @@ struct Model::Impl {
 
     // the DSpark drafter's taps: the streams' mean entering target layer il, on device d (after the last seeding read
     // h_taps)
-    bool tap(Dev& d, int il, int T, std::string& err) {
+    bool tap(Dev& d, int il, int T, std::string& err, float* device_taps = nullptr) {
         const auto it = std::find(g.d_targets.begin(), g.d_targets.end(), il);
         if (g.n_mtp == 0 || it == g.d_targets.end()) return true;
         const size_t j = (size_t) (it - g.d_targets.begin()), nt = g.d_targets.size();
         const int D = g.dim;
         cudaSetDevice(d.id);
+        if (device_taps != nullptr) {
+            // Identical FP32 mean kernel/launch; only the output row stride changes.
+            hc_mean(d.h, T, g.hc, D, device_taps + j * D, (int) nt * D, d.st);
+            return true;
+        }
         hc_mean(d.h, T, g.hc, D, d.tap, D, d.st);
         CK(cudaStreamWaitEvent(d.st, ev_seed, 0));
         CK(cudaMemcpy2DAsync(h_taps + j * D, nt * D * 4, d.tap, (size_t) D * 4, (size_t) D * 4, (size_t) T,
@@ -9411,7 +9737,8 @@ struct Model::Impl {
         return true;
     }
 
-    bool forward(const int* tk, int T, int logits_rows, std::string& err, int seed_rows = -1) {
+    bool forward(const int* tk, int T, int logits_rows, std::string& err, int seed_rows = -1,
+                 float* device_taps = nullptr) {
 #if defined(STRATA_METAL)
         struct BusyAll {   // DS4_BUSY_ALL: the GPU is held busy for the whole step (the host gaps between its bursts too)
             bool on;
@@ -9457,7 +9784,7 @@ struct Model::Impl {
         const double tl = now_ms();
         if (par) {
             if (!forward_par(p0, T, err)) return false;
-        } else if (!forward_serial(p0, T, err)) return false;
+        } else if (!forward_serial(p0, T, err, device_taps)) return false;
         st.layer_ms += now_ms() - tl;
         for (auto& b : eg_win)
             if (b->live) eg_finish(*b);
@@ -9469,10 +9796,13 @@ struct Model::Impl {
         CK(cudaStreamSynchronize(d.st));
         st.head_ms += now_ms() - th;
         prof_collect();
+        // Drafting also visits forward_layer. Do not let its marks leak into the
+        // next profiled single-token window (across an intervening verify call).
+        prof_window = false;
         pos += T;
         st.tokens += T;
         cache_tick(T);
-        if (seed_rows != 0 && !seed_drafter(p0, seed_rows < 0 ? T : seed_rows, 0, err)) return false;
+        if (seed_rows != 0 && !seed_drafter(p0, seed_rows < 0 ? T : seed_rows, 0, err, device_taps)) return false;
         return true;
     }
 
@@ -9492,7 +9822,7 @@ struct Model::Impl {
         for (size_t i = 0; i < n; ++i) { const float v = hp[i]; if (!(v == v)) ++nf; else if (std::fabs(v) > mx) mx = std::fabs(v); }
         std::fprintf(stderr, "DBG hmax %s T=%d max=%.4g nonfinite=%zu h0=%g\n", tag, T, mx, nf, hp[0]);
     }
-    bool forward_serial(int64_t p0, int T, std::string& err) {
+    bool forward_serial(int64_t p0, int T, std::string& err, float* device_taps = nullptr) {
         const int D = g.dim, H = g.hc;
         int cur = L[0].dev;
         if (ds4_dbg("DS4_SYNC_WIN")) cudaDeviceSynchronize();
@@ -9535,7 +9865,7 @@ struct Model::Impl {
                 CK(cudaMemcpyAsync(b.cand, bb + nh + np + nk, nc, cudaMemcpyHostToDevice, b.st));
                 cur = l.dev;
             }
-            if (!tap(devs[(size_t) l.dev], il, T, err)) return false;
+            if (!tap(devs[(size_t) l.dev], il, T, err, device_taps)) return false;
             if (il == 0 && ds4_dbg("DS4_DBG_EMB")) dbg_h("after tap", devs[(size_t) l.dev], T);
             if (!layer(l, 0, p0, T, wplan, err)) return false;
             if (dump_h != nullptr) {   // DS4_DUMP_H: every layer's residual stream, for tools/ds4/compare.py --layers
@@ -10023,20 +10353,61 @@ struct Model::Impl {
             // the routing goes to the service thread through the mailbox (a group's lead publishes it, the members
             // make the same plan) while the device runs the shared expert and the VRAM experts (from the plan the
             // router made), and waits for the answer only before the experts' sum
-            gemv_f32(l.gate_w, d.x, l.n_exp, D, T, d.glog, 1024, s);
+            const bool router_owned = router_gemv_static_batch && !kHipBuild && devs.size() == 1 && !par &&
+                                      nm == 1 && mi == 0;
+            const Layer* router_next[2] = {};
+            bool batch_router = false;
+            if (router_owned) {
+                ++router_owner_async;
+                if (D != 5120 || T < 1 || T > 4) ++router_fallback_shape;
+                else if (ahead_mode < 2) ++router_fallback_ahead;
+                else {
+                    router_next[0] = ahead_layer(L0, 1);
+                    if (router_next[0] != nullptr) router_next[1] = ahead_layer(L0, 2);
+                    if (router_next[1] != nullptr) batch_router = true;
+                    else ++router_fallback_near;
+                }
+            }
+            if (!batch_router) gemv_f32(l.gate_w, d.x, l.n_exp, D, T, d.glog, 1024, s);
             const unsigned sq = wp.seq[l.il];
             const int slot = (int) (sq % kRing);
             const bool lead = mi == 0;
             int na[2] = {0, 0};   // lookahead: the next layers' guesses (their gate on this FFN input), published below
-            for (int a = 1; lead && a <= std::min(2, ahead_mode); ++a) {
-                const Layer* nx = ahead_layer(L0, a);
-                if (nx == nullptr) break;
-                const int m = a == 1 ? std::max(1, std::min(kAhead1, nx->k_exp + ahead_extra)) : std::min(kPicks, nx->k_exp);
-                float* gl = d.glog_a + (size_t) (a - 1) * kWin * 1024;
-                gemv_f32(nx->gate_w, d.x, nx->n_exp, D, T, gl, 1024, s);   // (normed with the next layer's FFN
-                                                                         // weights instead: the same hit rate)
-                route_ahead(gl, nx->gate_bias, nx->n_exp, m, T, reqs + slot, (a - 1) * kAhead1, s);
-                na[a - 1] = m;
+            if (batch_router) {
+                F32RouterJobs jobs;
+                jobs.w[0] = l.gate_w;
+                jobs.y[0] = d.glog;
+                jobs.n[0] = l.n_exp;
+                jobs.count = 1;
+                for (int a = 1; a <= 2; ++a) {
+                    const Layer* nx = router_next[a - 1];
+                    jobs.w[a] = nx->gate_w;
+                    jobs.y[a] = d.glog_a + (size_t) (a - 1) * kWin * 1024;
+                    jobs.n[a] = nx->n_exp;
+                    ++jobs.count;
+                }
+                gemv_f32_router_static(jobs, d.x, D, T, 1024, s);
+                ++router_groups3;
+                ++router_t3[T - 1];
+                // Publish no early hint: each independent logit matrix is now ready on the same stream.
+                // Preserve ahead rank, offset, selection arithmetic and final mailbox publication order.
+                for (int a = 1; a < jobs.count; ++a) {
+                    const Layer* nx = router_next[a - 1];
+                    const int m = a == 1 ? std::max(1, std::min(kAhead1, nx->k_exp + ahead_extra)) : std::min(kPicks, nx->k_exp);
+                    route_ahead(jobs.y[a], nx->gate_bias, nx->n_exp, m, T, reqs + slot, (a - 1) * kAhead1, s);
+                    na[a - 1] = m;
+                }
+            } else {
+                for (int a = 1; lead && a <= std::min(2, ahead_mode); ++a) {
+                    const Layer* nx = ahead_layer(L0, a);
+                    if (nx == nullptr) break;
+                    const int m = a == 1 ? std::max(1, std::min(kAhead1, nx->k_exp + ahead_extra)) : std::min(kPicks, nx->k_exp);
+                    float* gl = d.glog_a + (size_t) (a - 1) * kWin * 1024;
+                    gemv_f32(nx->gate_w, d.x, nx->n_exp, D, T, gl, 1024, s);   // (normed with the next layer's FFN
+                                                                             // weights instead: the same hit rate)
+                    route_ahead(gl, nx->gate_bias, nx->n_exp, m, T, reqs + slot, (a - 1) * kAhead1, s);
+                    na[a - 1] = m;
+                }
             }
             route_publish(d.glog, l.gate_bias, l.n_exp, l.k_exp, T, g.route_scale, l.vram_tab, d.x, D, d.ridx, d.rw,
                           d.plan_ptr, lead ? reqs + slot : nullptr, sq, s, l.gate_bias_vl, l.mtp ? 0u : wp.vl, na[0],
@@ -10325,25 +10696,7 @@ struct Model::Impl {
     }
 
     int sample(float temperature, float top_p, int top_k, float min_p, uint64_t seed, uint64_t counter) {
-        Dev& d = devs[(size_t) head_dev];
-        cudaSetDevice(d.id);
-        strata::dsv41k::SamplerParams sp;
-        sp.temperature = temperature;
-        sp.greedy = temperature <= 0.0f;
-        sp.top_p = top_p;
-        sp.top_k = top_k;
-        sp.min_p = min_p;
-        sp.seed = seed;
-        sp.counter = counter;
-        strata::dsv41k::sample_tokens(d.logits + (size_t) std::max(0, n_logits - 1) * g.vocab, 1, g.vocab, nullptr, 0,
-                                       sp, d.tok, d.st);
-        int t = -1;
-#if defined(STRATA_METAL)
-        ds4_metal_flush();   // (a host read of a device result: commit the batched dispatches first)
-#endif
-        cudaMemcpyAsync(&t, d.tok, 4, cudaMemcpyDeviceToHost, d.st);
-        cudaStreamSynchronize(d.st);
-        return t;
+        return sample_row(std::max(0,n_logits-1),temperature,top_p,top_k,min_p,seed,counter,nullptr);
     }
 
     bool logits(std::vector<float>& out) {
@@ -10382,6 +10735,7 @@ struct Model::Impl {
                                    "cpu_experts=%d ram_experts=%d engine=ds4-0.1",
                       (long long) o.max_context, (long long) o.max_context, g.nl * g.n_exp - nh, nh, ram_held);
         v.push_back(b);
+        v.push_back("INFO full_vocab_sampling=1 json_schema_constraint=1 strict_tool_constraint=1 sampler_impl=native_host_full sampler_vocab="+std::to_string(g.vocab));
         if (commit_kept > 0) {   // (Windows, an integrated GPU: the commit kept experts off the GPU - the server says so)
             std::snprintf(b, sizeof b,
                           "NOTE experts: %.0f GB stay off the GPU - Windows' page file is too small to hold them there; "
@@ -10405,6 +10759,11 @@ struct Model::Impl {
                           (long long) pk.num("vision.max_wh_ratio", 0), img_tok, vt.device(),
                           (long long) (vt.device_bytes() >> 20));
             v.push_back(b);
+            if (vision_required) {
+                std::snprintf(b, sizeof b, "INFO vision_required=1 original_bias_metadata_layers=%d "
+                                          "encode_execution_certified=0", g.nl);
+                v.push_back(b);
+            }
         } else if (!vision_err.empty()) {   // (the server offers no pictures and says why)
             std::string why = vision_err;
             for (char& ch : why)
@@ -10454,6 +10813,12 @@ int Model::feed_unit() const { return p_->chunk > 0 ? std::max(p_->chunk, (int) 
 void Model::set_progress(std::function<void(int64_t)> f) { p_->progress = std::move(f); }
 void Model::set_cancel(std::function<bool()> f) { p_->cancel = std::move(f); }
 bool Model::cancelled() const { return p_->halted; }
+void Model::report_grammar() const {
+    if (p_->grammar && std::getenv("STRATA_DS4_TOOL_MASK_PROOF")) {
+        auto proof=p_->grammar->proof();if(!proof.empty())std::fprintf(stderr,"%s\n",proof.c_str());
+    }
+}
+void Model::set_grammar(std::shared_ptr<Grammar> grammar) {p_->grammar=std::move(grammar);}
 int Model::sample(float t, float tp, int tk, float mp, uint64_t seed, uint64_t counter) {
     return p_->sample(t, tp, tk, mp, seed, counter);
 }

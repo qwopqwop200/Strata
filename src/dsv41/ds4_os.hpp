@@ -12,6 +12,7 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <cstring>
 #include <cstdio>
 #include <cstdlib>
 #include <sstream>
@@ -41,6 +42,12 @@
 #endif
 
 namespace strata::ds4::os {
+
+/// Bound startup file-cache warming by the RAM left after device allocations.
+inline uint64_t warm_limit(uint64_t requested, uint64_t available, uint64_t margin) {
+    if (available == ~uint64_t{0}) return requested;
+    return available > margin ? std::min(requested, available - margin) : 0;
+}
 
 /// Windows sleeps in 15.6 ms ticks unless a process asks for finer ones: the CPU lane's service thread naps (sleep_for 20 us)
 /// between tokens, and the device's first wait of the next token then waits out the tick.  1 ms for the process's life
@@ -316,7 +323,7 @@ inline void advise(fd_t f, uint64_t off, uint64_t n, bool need) {
 
 /// Ranges of a file's mapping about to be read: the OS reads them in now, with large requests side by side, instead of
 /// a page fault at a time later (Windows: PrefetchVirtualMemory - cold expert-sized pieces came in 5x faster on an NVMe;
-/// Linux: madvise WILLNEED, the kernel's read-ahead of the whole range).  Best effort: a failure changes nothing.
+/// Linux: madvise WILLNEED, subject to the kernel's per-request readahead limit).  Best effort: a failure changes nothing.
 inline void prefetch(const std::vector<std::pair<const void*, size_t>>& ranges) {
     if (ranges.empty()) return;
 #if defined(_WIN32)
@@ -337,9 +344,9 @@ inline void prefetch(const std::vector<std::pair<const void*, size_t>>& ranges) 
 
 /// Whether every page of [p, p + n) of a file's mapping is in the page cache (Linux mincore; elsewhere false: the
 /// caller reads buffered anyway, which the cache serves)
-inline bool resident(const void* p, size_t n) {
+inline bool resident(const void* p, size_t n, unsigned min_percent = 100) {
 #if defined(_WIN32)
-    (void) p, (void) n;
+    (void) p, (void) n, (void) min_percent;
     return false;
 #else
     const uintptr_t pg = 4096, a = (uintptr_t) p, b = a & ~(pg - 1);
@@ -347,6 +354,13 @@ inline bool resident(const void* p, size_t n) {
     thread_local std::vector<unsigned char> v;
     if (v.size() < np) v.resize(np);
     if (mincore((void*) b, len, v.data()) != 0) return false;
+    if (min_percent > 0 && min_percent < 100) {
+        const size_t limit = (np / 100) * (100 - min_percent) + (np % 100) * (100 - min_percent) / 100;
+        size_t cold = 0;
+        for (size_t i = 0; i < np; ++i)
+            if ((v[i] & 1) == 0 && ++cold > limit) return false;
+        return true;
+    }
     for (size_t i = 0; i < np; ++i)
         if ((v[i] & 1) == 0) return false;
     return true;
@@ -395,6 +409,44 @@ inline void prefetch_cold(const std::vector<std::pair<const void*, size_t>>& ran
     prefetch(cold);
 #else
     prefetch(ranges);
+#endif
+}
+
+// Startup-only caller: retain cached reads, use bounded aligned scratch for cold file ranges.
+// Never expose direct-I/O alignment bytes to the destination; failures use the original buffered read.
+inline bool pread_cached_or_direct(fd_t fd, fd_t dfd, const void* mapped, void* dst,
+                                   void* scratch, size_t capacity, uint64_t n, uint64_t off,
+                                   bool& used_direct) {
+    used_direct=false;
+#if defined(__linux__)
+    if(n && dfd!=kBadFd && scratch && (uintptr_t)scratch%kDirectAlign==0 &&
+       direct_span(off,n)<=capacity && mapped && !resident(mapped,(size_t)n) &&
+       pread_direct(dfd,scratch,n,off)) {
+        std::memcpy(dst,(const uint8_t*)scratch+off%kDirectAlign,(size_t)n);
+        used_direct=true;
+        return true;
+    }
+#endif
+    return pread_par(fd,dst,n,off);
+}
+
+// Optional background lookahead: populate only fully cached file ranges. Cold ranges keep the original hint.
+inline void prefetch_populate_cached(const std::vector<std::pair<const void*, size_t>>& ranges, bool cold_hint = true) {
+#if defined(__linux__) && defined(MADV_POPULATE_READ)
+    static thread_local bool available=true;
+    if(!available){if(cold_hint)prefetch_cold(ranges);return;}
+    const uintptr_t pg=4096;
+    for(const auto& x:ranges){
+        if(x.second==0)continue;
+        const uintptr_t a=(uintptr_t)x.first,b=a&~(pg-1);const size_t len=x.second+(a-b);
+        if(available && resident(x.first,x.second)){
+            if(madvise((void*)b,len,MADV_POPULATE_READ)==0)continue;
+            available=false;
+        }
+        if(cold_hint)madvise((void*)b,len,MADV_WILLNEED);
+    }
+#else
+    if(cold_hint)prefetch_cold(ranges);
 #endif
 }
 
@@ -458,7 +510,10 @@ inline void* anon_alloc(size_t bytes, int node, int nodes) {
 #else
     void* m = ::mmap(nullptr, bytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     if (m == MAP_FAILED) return nullptr;
-    madvise(m, bytes, MADV_HUGEPAGE);
+    // Opt out of synchronous huge-page compaction on memory shared with the GPU.
+    // The existing advice stays the default; DS4_HOST_THP=0 affects host arenas only.
+    const char* thp = std::getenv("DS4_HOST_THP");
+    madvise(m, bytes, thp != nullptr && std::atoi(thp) == 0 ? MADV_NOHUGEPAGE : MADV_HUGEPAGE);
     if (node >= 0 && nodes > 1) {
         unsigned long mask[4] = {0, 0, 0, 0};
         mask[node / 64] = 1ul << (node % 64);
@@ -608,3 +663,38 @@ inline Commit commit() {
 }
 
 }  // namespace strata::ds4::os
+
+namespace strata::ds4::os {
+// Linux can cap one WILLNEED request. Split only confirmed demand ranges when opted in.
+inline void prefetch_chunked(const std::vector<std::pair<const void*, size_t>>& ranges, size_t chunk_bytes) {
+#if defined(_WIN32)
+    (void)chunk_bytes;
+    prefetch(ranges);
+#else
+    if (chunk_bytes == 0) return prefetch(ranges);
+    const uintptr_t pg = 4096;
+    const size_t chunk = std::max<size_t>(pg, chunk_bytes / pg * pg);
+    for (const auto& x : ranges) {
+        if (x.second == 0) continue;
+        if (resident(x.first, x.second)) {
+#if defined(__linux__) && defined(MADV_POPULATE_READ)
+            static const bool populate = [] {const char* v=std::getenv("DS4_IQ_POPULATE_WARM");return v && std::atoi(v)!=0;}();
+            static thread_local bool available=true;
+            if(populate && available){
+                const uintptr_t a=(uintptr_t)x.first,b=a&~(pg-1);
+                if(madvise((void*)b,x.second+(a-b),MADV_POPULATE_READ)!=0)available=false;
+            }
+#endif
+            continue;
+        }
+        const uintptr_t a = (uintptr_t)x.first, start = a & ~(pg - 1);
+        const size_t len = x.second + (a - start);
+        for (size_t off = 0; off < len;) {
+            const size_t n = std::min(chunk, len - off);
+            madvise((void*)(start + off), n, MADV_WILLNEED);
+            off += n;
+        }
+    }
+#endif
+}
+}
