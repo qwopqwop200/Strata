@@ -54,6 +54,8 @@ class NativeSchema(unittest.TestCase):
         self.assertEqual(actual,messages)
         self.assertNotIn('_native_grammar',req)
         self.assertIsInstance(v,NativeValidator)
+        with self.assertRaisesRegex(ValueError,'tools are unsupported'):
+            prepare_format(fmt,messages,svc,{},with_tools=True)
         raw=' {"한글" : "\\uac00"} \n'
         self.assertEqual(validated_raw(raw,v,'stop'),raw)
         for text,finish in [(raw,'length'),('prose '+raw,'stop'),('{"x":','stop')]:

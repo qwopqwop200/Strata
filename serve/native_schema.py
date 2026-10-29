@@ -149,6 +149,7 @@ def prepare_format(fmt,messages,svc,req,with_tools=False):
     svc.load()
     if getattr(svc.engine,'info',{}).get('json_schema_constraint')!=1:
         return legacy(fmt,messages,with_tools=with_tools,require_constraint=svc.require_strict_schema_constraint)
+    if with_tools:raise ValueError('native structured responses with tools are unsupported')
     if fmt.get('repair_latex_escapes'):raise ValueError('native constraints do not repair output')
     _,validator=legacy(fmt,messages,with_tools=with_tools,require_constraint=False)
     schema={'type':'object'} if fmt['type']=='json_object' else fmt['json_schema']['schema']
