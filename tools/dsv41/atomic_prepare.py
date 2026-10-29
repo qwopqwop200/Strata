@@ -10,7 +10,7 @@ HERE=Path(__file__).resolve().parent;REPO=HERE.parent.parent
 sys.path.insert(0,str(HERE));from retained_draft import attach_q4
 ROOT=Path('/home/qwopqwop200/models/AtomicChat-DeepSeek-V4.1-IQ2_XXS')
 LOCK=Path('/home/qwopqwop200/Strata-tuning/.validation.lock');STOP=REPO.parent/'STOP'
-ATOMIC='5a2bf2d79e7c9021f6e36fcbbe3f41651308d922';ISTA='a419d74cd28d5b9f8c5e2b9077d11a609c17bc32'
+ATOMIC='a419d74cd28d5b9f8c5e2b9077d11a609c17bc32';ISTA='a419d74cd28d5b9f8c5e2b9077d11a609c17bc32'
 def sha(p):return hashlib.sha256(Path(p).read_bytes()).hexdigest()
 def identity(p):
  s=Path(p).stat();return [s.st_dev,s.st_ino,s.st_size,s.st_mtime_ns,s.st_ctime_ns]
@@ -20,7 +20,7 @@ def validate(root):
  done={x['path']:x for x in s['completed']};seen=set();files=[]
  for x in m['files']:
   expected=ATOMIC if x['subdir']=='backbone' else ISTA
-  repo='AtomicChat/DeepSeek-V4.1-Flash-1017-Uncensored-GSQ-RCO-GGUF'if x['subdir']=='backbone'else'ISTA-DASLab/DeepSeek-V4.1-Flash-1017-GSQ-RCO-GGUF'
+  repo='ISTA-DASLab/DeepSeek-V4.1-Flash-1017-GSQ-RCO-GGUF'if x['subdir']=='backbone'else'ISTA-DASLab/DeepSeek-V4.1-Flash-1017-GSQ-RCO-GGUF'
   if x['subdir']not in ['backbone','original']or x['repo']!=repo or x['revision']!=expected:raise ValueError('wrong pinned revision')
   p=root/x['subdir']/x['filename'];r=done.get(str(p));checksum=x.get('sha256')or x['git_blob']
   if not r or r.get('verified')is not True or r['checksum']!=checksum or r['size']!=x['size']or p.stat().st_size!=x['size']:raise ValueError('unverified/missing artifact '+str(p))
@@ -60,7 +60,7 @@ def main():
   first=next(root/'backbone'/x['filename']for x in m['files']if x['subdir']=='backbone'and'-00001-'in x['filename'])
   tokenizer_kv={k:v for k,v in Gguf(first).kv.items()if k.startswith('tokenizer.')}
   historical_probe=REPO/'header-probes'/(first.name+'.header-prefix')
-  tokenizer_source=dict(kind='atomic_embedded_gguf',repo='AtomicChat/DeepSeek-V4.1-Flash-1017-Uncensored-GSQ-RCO-GGUF',revision=ATOMIC,source_file=str(first),header_probe=str(historical_probe)if historical_probe.is_file()else None,header_probe_role='historical_optional_not_complete_file_verification',source_file_sha256=next(x['sha256']for x in m['files']if x['subdir']=='backbone'and x['filename']==first.name),tokenizer_metadata_sha256=hashlib.sha256(json.dumps(tokenizer_kv,sort_keys=True,separators=(',',':')).encode()).hexdigest(),full_files_verified=True,chat_template_override=str(root/'original/chat_template.jinja'),chat_template_sha256=sha(root/'original/chat_template.jinja'))
+  tokenizer_source=dict(kind='atomic_embedded_gguf',repo='ISTA-DASLab/DeepSeek-V4.1-Flash-1017-GSQ-RCO-GGUF',revision=ATOMIC,source_file=str(first),header_probe=str(historical_probe)if historical_probe.is_file()else None,header_probe_role='historical_optional_not_complete_file_verification',source_file_sha256=next(x['sha256']for x in m['files']if x['subdir']=='backbone'and x['filename']==first.name),tokenizer_metadata_sha256=hashlib.sha256(json.dumps(tokenizer_kv,sort_keys=True,separators=(',',':')).encode()).hexdigest(),full_files_verified=True,chat_template_override=str(root/'original/chat_template.jinja'),chat_template_sha256=sha(root/'original/chat_template.jinja'))
   tokenizer_source['export_sha256']={n:sha(out/'tokenizer'/n)for n in ['vocab.json','merges.txt','token_type.json','tokenizer.json','chat_template.jinja']}
   (out/'tokenizer/tokenizer-source.json').write_text(json.dumps(tokenizer_source,indent=2)+'\n')
   if before!={str(p):identity(p)for p in set(inputs)}or source_before!={p:sha(p)for p in source_before}:raise ValueError('immutable input/source stat identity drift')
@@ -68,6 +68,6 @@ def main():
   mapping=verify_pack(out,root,m)
   text=(out/'tensors.txt').read_text()
   if 'Abiray-'in text:raise ValueError('old model path leaked into new runtime dependency table')
-  result=dict(schema=1,status='PACK_PREPARED_NOT_MODEL_VALIDATED',pack_root=str(out),model_root=str(root),actual_new_model_pack=True,files_verified=True,target_repo='AtomicChat/DeepSeek-V4.1-Flash-1017-Uncensored-GSQ-RCO-GGUF',target_revision=ATOMIC,auxiliary_revision=ISTA,target_shards=[dict(repo=x['repo'],path=str(root/x['subdir']/x['filename']),size=x['size'],sha256=x['sha256'],revision=x['revision'])for x in m['files']if x['subdir']=='backbone'],original_auxiliaries=[dict(x,path=str(root/x['subdir']/x['filename']))for x in m['files']if x['subdir']=='original'],tokenizer_source=tokenizer_source,mapping_proof=mapping,pack_files_sha256={str(p.relative_to(out)):sha(p)for p in out.rglob('*')if p.is_file()},download_manifest_sha256=sha(root/'download-manifest.json'),download_status_sha256=sha(root/'download-status.json'),source_sha256=source_before,input_stat_prepost_equal=True,full_payload_hashes='Downloader remote checksums ALL_VERIFIED; no redundant 249GB hash in metadata preparation',retained_Q4=proof,target_weight_payload_modified=False,Engram_payload_modified=False,model_acceptance_pass=False,vision_pass=False,context1M_pass=False,tensor_table_sha256=sha(out/'tensors.txt'),ds4_sha256=sha(out/'ds4.txt'),requires_followup=['Atomic text/code/image/1M actual runtime','frontend/tokenizer JoyAI alias integrated','default launcher path readback','dependency closure before old deletion'])
+  result=dict(schema=1,status='PACK_PREPARED_NOT_MODEL_VALIDATED',pack_root=str(out),model_root=str(root),actual_new_model_pack=True,files_verified=True,target_repo='ISTA-DASLab/DeepSeek-V4.1-Flash-1017-GSQ-RCO-GGUF',target_revision=ATOMIC,auxiliary_revision=ISTA,target_shards=[dict(repo=x['repo'],path=str(root/x['subdir']/x['filename']),size=x['size'],sha256=x['sha256'],revision=x['revision'])for x in m['files']if x['subdir']=='backbone'],original_auxiliaries=[dict(x,path=str(root/x['subdir']/x['filename']))for x in m['files']if x['subdir']=='original'],tokenizer_source=tokenizer_source,mapping_proof=mapping,pack_files_sha256={str(p.relative_to(out)):sha(p)for p in out.rglob('*')if p.is_file()},download_manifest_sha256=sha(root/'download-manifest.json'),download_status_sha256=sha(root/'download-status.json'),source_sha256=source_before,input_stat_prepost_equal=True,full_payload_hashes='Downloader remote checksums ALL_VERIFIED; no redundant 249GB hash in metadata preparation',retained_Q4=proof,target_weight_payload_modified=False,Engram_payload_modified=False,model_acceptance_pass=False,vision_pass=False,context1M_pass=False,tensor_table_sha256=sha(out/'tensors.txt'),ds4_sha256=sha(out/'ds4.txt'),requires_followup=['Atomic text/code/image/1M actual runtime','frontend/tokenizer JoyAI alias integrated','default launcher path readback','dependency closure before old deletion'])
   (out/'atomic-pack-proof.json').write_text(json.dumps(result,indent=2)+'\n');print(json.dumps(result,indent=2));return 0
 if __name__=='__main__':raise SystemExit(main())

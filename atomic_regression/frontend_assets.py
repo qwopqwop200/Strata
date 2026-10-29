@@ -7,8 +7,8 @@ sys.path.insert(0,str(ROOT));sys.path.insert(0,str(ROOT/'tools'))
 from serve.frontend import ChatTemplate,literal_tags,mark_think_literals,unmark_think_literals
 from serve import dsml
 import strata_tokenizer as ST
-ATOMIC_REPO='AtomicChat/DeepSeek-V4.1-Flash-1017-Uncensored-GSQ-RCO-GGUF'
-ATOMIC_REV='5a2bf2d79e7c9021f6e36fcbbe3f41651308d922'
+ATOMIC_REPO='ISTA-DASLab/DeepSeek-V4.1-Flash-1017-GSQ-RCO-GGUF'
+ATOMIC_REV='a419d74cd28d5b9f8c5e2b9077d11a609c17bc32'
 ORIGINAL_REPO='ISTA-DASLab/DeepSeek-V4.1-Flash-1017-GSQ-RCO-GGUF'
 ORIGINAL_REV='a419d74cd28d5b9f8c5e2b9077d11a609c17bc32'
 MODEL=Path('/home/qwopqwop200/models/AtomicChat-DeepSeek-V4.1-IQ2_XXS')
