@@ -829,9 +829,8 @@ def tool_choice_of(tool_choice) -> tuple[str, str | None]:
 def forced_call(tool_choice, tools: list[dict] | None) -> str | None:
     """`tool_choice` -> the text that opens the call the reply must make, or None (the model decides).
     There is no grammar here: the server writes this opening itself, so the model can only go on with a call.
-    "required" / Anthropic "any": any of the tools; a named function: that one.  A value it cannot honour (an
-    unknown shape, a name that is not one of the tools, "required" with no tools) is logged and acts as "auto",
-    not a 400: a client's odd choice must not stop its request.  "none" is handled by the caller (no tools)."""
+    "required" / Anthropic "any": any of the tools; a named function: that one. Reject a choice the server cannot
+    honour before generation, rather than silently replacing it with "auto". "none" is handled by the caller."""
     kind, name = tool_choice_of(tool_choice)
     names = {t.get("name") for t in tools or [] if isinstance(t, dict)}
     if kind in ("auto", "none"):
@@ -842,9 +841,7 @@ def forced_call(tool_choice, tools: list[dict] | None) -> str | None:
         return CALL_START + "\n<function="
     if kind == "named" and name in names:
         return CALL_START + f"\n<function={name}>\n"
-    print(f"[strata] tool_choice {json.dumps(tool_choice)[:200]} is not supported here (or names no tool of the "
-          "request): the model decides, as with \"auto\"", flush=True)
-    return None
+    raise ValueError("tool_choice is unsupported, names an undeclared tool, or requires tools but none were provided")
 
 
 PARAM_START = "<parameter="

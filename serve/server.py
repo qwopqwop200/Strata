@@ -4845,14 +4845,15 @@ class Service:
             return round(v / unit, digits) if isinstance(v, (int, float)) else None
 
         busy, ctx = bool(s.get("busy")), self.reported_ctx()
+        constrained = (getattr(self.engine, "info", {}) or {}).get("json_schema_constraint") == 1
         images = self.vision is not None
         return {
             "service": "strata", "model": self.model,
             "loaded": self.loaded(), "auto_load": hasattr(self.engine, "restart"),
-            "structured_output": {"formats": ["json_object", "json_schema"], "method": "native_token_mask" if self.engine.info.get("json_schema_constraint")==1 else "prompt_and_validate",
-                                  "constrained_decoding": self.engine.info.get("json_schema_constraint")==1, "stream_buffered": True,
-                                  **({"strict_json_schema": self.engine.info.get("json_schema_constraint")==1,
-                                      "json_schema_requires_explicit_strict_false": self.engine.info.get("json_schema_constraint")!=1}
+            "structured_output": {"formats": ["json_object", "json_schema"], "method": "native_token_mask" if constrained else "prompt_and_validate",
+                                  "constrained_decoding": constrained, "stream_buffered": True,
+                                  **({"strict_json_schema": constrained,
+                                      "json_schema_requires_explicit_strict_false": not constrained}
                                      if self.require_strict_schema_constraint else {})},
             **({"output_budget": {"default_requested_max_tokens": self.default_max_tokens,
                                   "total_context_tokens": ctx, "context_slack_tokens": self.context_slack_tokens,
