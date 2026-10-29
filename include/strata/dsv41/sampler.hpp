@@ -16,7 +16,7 @@
 namespace strata::dsv41k {
 
 struct SamplerParams {
-    int top_k = 20;              // sampled path: 1..64 as given; 0 (off) or more than 64 keep the widest list, 64
+    int top_k = 0;               // 0: entire actual vocabulary; a positive value is an optional cut
     float top_p = 0.95f;         // 1.0 disables the filter
     float min_p = 0.0f;          // 0 disables; keeps tokens with p >= min_p * p_max (a prefix of the top_k list)
     float temperature = 1.0f;    // <= 0 means greedy
@@ -31,6 +31,8 @@ struct SamplerParams {
     // a request's logit_bias: a DEVICE array of n_vocab floats on the sampling device, added to every row's logits
     // before the penalties and the filters (-inf bans a token); nullptr = none
     const float* logit_bias = nullptr;
+    // Host-only byte mask. Sampling stages it before normalization; kernels never dereference this pointer.
+    const std::vector<uint8_t>* host_allowed = nullptr;
     // the GLM engine's penalty history, on the HOST (never read by a kernel): every token the request's state has been
     // fed so far, oldest first - its prompt, then each token it wrote.  Glm5Model::pick_tokens hands each pick the last
     // penalty_last_n of them (a verify window's row t: these, then the window's drafts 1..t).  nullptr = none
@@ -59,9 +61,11 @@ void sample_tokens(const float* logits, int n_tokens, int n_vocab, const int* hi
 // plain draw from p, and a draft stands whenever the token is the draft (sum over x of min(p(x), q(x)) of the time
 // instead of p(argmax q)).  Same (seed, counter): the same tokens - but not the plain draw's tokens.
 struct SpecList {
-    int n = 0;          // the kept list's length (1..64)
+    int n = 0;          // positive: compact list; negative: dense distribution of -n vocabulary entries
     int ids[64];        // descending, as the selection produced them
     double p[64];       // q over the kept list (sums to 1)
+    double* full = nullptr;  // caller-owned DEVICE allocation, sized from the model's actual vocabulary
+    int capacity = 0;
 };
 
 // draft rows: logits (n_tokens, n_vocab) -> out[t] drawn through this chain, q[t] its kept list.  DEVICE pointers,

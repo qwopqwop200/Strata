@@ -120,6 +120,7 @@ def check(key: str, v, cfg: dict):
         return float(_number(key, v, hi=1, lo_open=True))
     if rule == "0<=x<=1":
         return float(_number(key, v, hi=1))
+    if cfg.get("arch")=="deepseek41":return _number(key,v,whole=True,lo=0,hi=2147483647)
     return _number(key, v, whole=True, lo=1, hi=64)
 
 

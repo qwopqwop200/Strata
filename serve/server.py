@@ -82,6 +82,7 @@ from serve import owner_guard  # noqa: E402
 from serve import launch_identity  # noqa: E402
 from serve import logit_bias as bias_api  # noqa: E402
 from serve import lifeline  # noqa: E402
+from serve import native_schema
 from serve.structured import StructuredOutputError, prepare_format, validated_json, extract_json  # noqa: E402
 from serve import responses as responses_api  # noqa: E402
 from serve.responses import ResponsesError, error_body as responses_error_body  # noqa: E402
@@ -1396,7 +1397,7 @@ class StrataEngine:
     def sampling_keys(sampling: dict) -> str:
         keys = ""
         t = sampling.get("temperature")
-        if isinstance(t, (int, float)) and float(t) > 0.0:
+        if isinstance(t, (int, float)) and (float(t) > 0.0 or sampling.get("_native_full_vocab")):
             keys += f" temperature={float(t)!r}"
         tp = sampling.get("top_p")
         if isinstance(tp, (int, float)) and float(tp) < 1.0:
@@ -1404,7 +1405,7 @@ class StrataEngine:
         tk = sampling.get("top_k")
         if isinstance(tk, int) and not isinstance(tk, bool) and tk >= 0:
             # the engine's sampled path keeps at most 64 candidates: 0 ("off") and wider lists get all 64
-            keys += f" top_k={tk if 1 <= tk <= 64 else 64}"
+            keys += f" top_k={tk if sampling.get("_native_full_vocab") else (tk if 1 <= tk <= 64 else 64)}"
         mp = sampling.get("min_p")
         if isinstance(mp, (int, float)) and 0.0 < float(mp) <= 1.0:
             keys += f" min_p={float(mp)!r}"
@@ -1472,6 +1473,10 @@ class StrataEngine:
             if ids:
                 # only these ids are printed; the engine's comma-separated list, renormalised below
                 keys += " allowed=" + ",".join(str(i) for i in ids)
+        if sampling.get("_native_full_vocab") and sampling.get("_native_grammar"):
+            path=sampling["_native_grammar"]
+            if not isinstance(path,str) or any(c.isspace() for c in path):raise ValueError("invalid native grammar path")
+            keys += " grammar="+path
         return keys + StrataEngine.projection_key(sampling) + bias_api.engine_key(sampling.get("logit_bias"))
 
     @staticmethod
@@ -2234,6 +2239,7 @@ class StrataEngine:
         has gone.  A consumer that stops early (or `cancel`) makes the engine STOP, so it does not run to max_new."""
         if not self.alive():
             raise EngineDied("the engine is unavailable; this request was not sent")
+        sampling={**(sampling or {}),"_native_full_vocab":self.info.get("full_vocab_sampling")==1}
         bias_api.validate_request(sampling or {}, self, None)
         if getattr(self, "batch", 0):
             yield from self.generate_batched(ids, max_new, sampling, cancel, embeddings)
@@ -4843,9 +4849,10 @@ class Service:
         return {
             "service": "strata", "model": self.model,
             "loaded": self.loaded(), "auto_load": hasattr(self.engine, "restart"),
-            "structured_output": {"formats": ["json_object", "json_schema"], "method": "prompt_and_validate",
-                                  "constrained_decoding": False, "stream_buffered": True,
-                                  **({"strict_json_schema": False, "json_schema_requires_explicit_strict_false": True}
+            "structured_output": {"formats": ["json_object", "json_schema"], "method": "native_token_mask" if self.engine.info.get("json_schema_constraint")==1 else "prompt_and_validate",
+                                  "constrained_decoding": self.engine.info.get("json_schema_constraint")==1, "stream_buffered": True,
+                                  **({"strict_json_schema": self.engine.info.get("json_schema_constraint")==1,
+                                      "json_schema_requires_explicit_strict_false": self.engine.info.get("json_schema_constraint")!=1}
                                      if self.require_strict_schema_constraint else {})},
             **({"output_budget": {"default_requested_max_tokens": self.default_max_tokens,
                                   "total_context_tokens": ctx, "context_slack_tokens": self.context_slack_tokens,
@@ -6377,6 +6384,10 @@ def structured_chunks(chunks, validator):
                 yield chunk if progress else None
         result = openai_collect(buffered)
         choice = result["choices"][0]
+        if getattr(validator,"native",False):
+            native_schema.validated_raw(choice["message"]["content"],validator,choice["finish_reason"])
+            yield from buffered
+            return
         content = validated_json(choice["message"]["content"], validator, choice["finish_reason"])
         # logprobs: the entries spell what the model wrote, which this function replaces with the
         # canonical JSON.  `_structured_logprobs` gives back the form the tokens spell, or None.
@@ -7619,8 +7630,7 @@ def make_handler(svc: Service):
             if tool_choice_of(req.get("tool_choice"))[0] == "none":   # as the Responses route: no tools are offered
                 tools = None
             force = svc.force_text(forced_call(req.get("tool_choice"), tools))      # a bad value is a 400 before anything is sent
-            messages, validator = prepare_format(req.get("response_format"), messages,
-                                                 require_constraint=svc.require_strict_schema_constraint)
+            messages, validator = native_schema.prepare_format(req.get("response_format"),messages,svc,req)
             if validator is not None and (tools or req.get("strata_mcp")):
                 raise ValueError("structured response_format with tools/MCP is not supported")
             svc.load()
@@ -7662,6 +7672,7 @@ def make_handler(svc: Service):
             cancel = threading.Event()
             self._watch_client(cancel)                       # #430 #431 (#1999: before prepare, which can take long)
             ids, thinking, max_new = svc.prepare(messages, tools, kw, max_new, force=force, req=req, cancel=cancel)
+            native_schema.bind_request(req,validator,svc.tok,thinking)
             _debug_req("openai", req, messages, tools, max_new, thinking, len(ids))
             run = run_with_mcp(svc, svc.mcp, messages, tools, kw, ids, thinking, max_new, max_req, req, cancel,
                                {t["name"] for t in extra}) if use_mcp else None
@@ -7739,7 +7750,7 @@ def make_handler(svc: Service):
                 return self._json(503, responses_error_body(str(e), "server_error", code="server_error"))
 
             def check(text, finish):
-                return validated_json(text, validator, finish)
+                return native_schema.validated_raw(text,validator,finish) if getattr(validator,"native",False) else validated_json(text, validator, finish)
 
             def events():
                 yield from asm.start()
@@ -7824,8 +7835,7 @@ def make_handler(svc: Service):
             except ValueError as e:
                 raise ResponsesError(str(e), "input") from None
             try:
-                messages, validator = prepare_format(responses_api.text_format(req), messages, with_tools=bool(tools),
-                                                     require_constraint=svc.require_strict_schema_constraint)
+                messages, validator = native_schema.prepare_format(responses_api.text_format(req),messages,svc,req,with_tools=bool(tools))
             except ValueError as e:
                 raise ResponsesError(str(e).replace("response_format", "text.format"), "text.format") from None
             noted = svc.__dict__.setdefault("hosted_tools_noted", set())   # said once per tool, not per request
@@ -7870,6 +7880,7 @@ def make_handler(svc: Service):
                     from None
             if svc.codex_compaction_cache:
                 responses_api.prompt_made(req, shown)
+            native_schema.bind_request(req,validator,svc.tok,thinking)
             _debug_req("responses", req, messages, tools, max_new, thinking, len(ids))
             include = req.get("include") if isinstance(req.get("include"), list) else []
             asm = responses_api.Assembler(req, svc.model_for(req), len(ids), names,
@@ -8283,8 +8294,10 @@ def clean_shared_defaults(d, family=None) -> dict:
             if not number or not 0 < value <= 1:
                 raise ValueError("top_p: 0 < top_p <= 1")
         elif key == "top_k":
-            if not number or value != int(value) or not 1 <= value <= 64:
-                raise ValueError("top_k: an integer 1..64")
+            hi=2147483647 if family=="deepseek41" else 64
+            lo=0 if family=="deepseek41" else 1
+            if not number or value != int(value) or not lo <= value <= hi:
+                raise ValueError(f"top_k: an integer {lo}..{hi}")
             value = int(value)
         elif key in ("seed", "max_tokens"):
             if not number or value != int(value) or value <= 0:
@@ -8440,8 +8453,9 @@ def sampling_defaults_from_config(cfg: dict) -> dict:
                 raise SystemExit(f"[strata] config sampling.min_p={value!r}: expected 0 <= min_p <= 1")
             out[key] = float(value)
         elif key == "top_k":
-            if not number or value != int(value) or not 1 <= value <= 64:
-                raise SystemExit(f"[strata] config sampling.top_k={value!r}: the sampled path takes an integer 1..64")
+            lo,hi=(0,2147483647) if cfg.get("arch")=="deepseek41" else (1,64)
+            if not number or value != int(value) or not lo <= value <= hi:
+                raise SystemExit(f"[strata] config sampling.top_k={value!r}: expected integer {lo}..{hi}")
             out[key] = int(value)
         elif key == "presence_penalty":
             if not number or value < 0:
@@ -8588,6 +8602,9 @@ def check_request_sampling(req) -> None:
             req[key] = value = num
         if isinstance(value, bool) or not isinstance(value, int if integer else (int, float)):
             raise ValueError(f"{key}: {'an integer' if integer else 'a number'}")
+        if key=="top_k" and not 0<=value<=2147483647:
+            raise ValueError("top_k: an integer 0..2147483647 (0: unlimited)")
+        if not integer and not math.isfinite(value):raise ValueError(f"{key}: a finite number")
 
 
 # the API's model name per model family (the GGUF architecture, "arch" in the config) when the config names none

@@ -239,8 +239,11 @@ bool round(strata::ds4::Model& m, int tok, int room, bool spec, float conf_min, 
         int keep = 0;
         if (cum_min < 0) cum_min = dspark_cum_default(m);
         float cum = 1.0f;
-        while (keep < (int) drafts.size() && keep < room - 1 && keep < g_spec_depth && conf[(size_t) keep] >= conf_min &&
-               (cum *= conf[(size_t) keep]) >= cum_min)
+        // A sampled q must not be selected conditionally on its sampled token/confidence: that would
+        // change q after it was saved. Deterministic argmax drafts retain the existing confidence gate.
+        const bool sampled_q=temperature>0 && std::getenv("DS4_DSPARK_SAMPLE") && std::atoi(std::getenv("DS4_DSPARK_SAMPLE"))!=0;
+        while (keep < (int) drafts.size() && keep < room - 1 && keep < g_spec_depth &&
+               (sampled_q || (conf[(size_t) keep] >= conf_min && (cum *= conf[(size_t) keep]) >= cum_min)))
             ++keep;
         if (keep > 0) {
             drafts.resize((size_t) keep);
@@ -276,8 +279,9 @@ bool round(strata::ds4::Model& m, int tok, int room, bool spec, float conf_min, 
 
 struct Req {
     long long max_new = 0;
-    float temperature = 0.0f, top_p = 1.0f, min_p = 0.0f;
-    int top_k = 64;
+    float temperature = 1.0f, top_p = 1.0f, min_p = 0.0f;
+    int top_k = 0;
+    std::string grammar_file;
     unsigned long long seed = 0;
     int spec = -1;          // spec=0|1: this request drafts or not (-1: as the engine was started)
     float conf = -1.0f;     // dspark_conf=F: the drafts' confidence floor for this request (-1: the engine's)
@@ -376,6 +380,7 @@ bool parse_gen(const std::string& line, Req& r, bool geni) {
         if (k == "temperature") r.temperature = std::strtof(v.c_str(), nullptr);
         else if (k == "top_p") r.top_p = std::strtof(v.c_str(), nullptr);
         else if (k == "top_k") r.top_k = std::atoi(v.c_str());
+        else if (k == "grammar") r.grammar_file = v;
         else if (k == "min_p") r.min_p = std::strtof(v.c_str(), nullptr);
         else if (k == "seed") r.seed = std::strtoull(v.c_str(), nullptr, 10);
         else if (k == "spec") r.spec = std::atoi(v.c_str()) != 0;
@@ -729,6 +734,13 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
             std::fflush(stdout);
             continue;
         }
+        try {
+            m.set_grammar(r.grammar_file.empty()?nullptr:strata::ds4::Grammar::load(r.grammar_file,m.vocab()));
+        } catch(const std::exception& e) {
+            std::printf("ERR grammar: %s\nDONE 0 %zu 0 0 cancel 0 0 0 0 0\n",e.what(),r.ids.size());std::fflush(stdout);continue;
+        }
+        std::fprintf(stderr,"ds4 sampler: full_vocab=1 vocab=%d top_k=%d temperature=%g top_p=%g grammar=%d\n",
+                     m.vocab(),r.top_k,r.temperature,r.top_p,!r.grammar_file.empty());
         const double t0 = now_ms();
         std::vector<Pic> pics;
         {
@@ -1502,7 +1514,7 @@ int main(int argc, char** argv) {
     long long d_off = 0, d_acc = 0, rounds = 0;
     bool cool = false;
     if (n > 0) {
-        int tok = m.sample(temp, 1.0f, temp > 0 ? 64 : 1, 0.0f, cli_seed, counter++);
+        int tok = m.sample(temp, 1.0f, temp > 0 ? 0 : 1, 0.0f, cli_seed, counter++);
         std::vector<int> got;
         for (;;) {
             out.push_back(tok);
@@ -1525,7 +1537,7 @@ int main(int argc, char** argv) {
             if (got.empty()) {
                 int off = 0, acc = 0;
                 const bool try_spec = spec && !cool;
-                if (!round(m, tok, n - (int) out.size(), try_spec, o.dspark_conf, temp, 1.0f, temp > 0 ? 64 : 1, 0.0f,
+                if (!round(m, tok, n - (int) out.size(), try_spec, o.dspark_conf, temp, 1.0f, temp > 0 ? 0 : 1, 0.0f,
                            cli_seed, counter, got, off, acc, err)) {
                     std::fprintf(stderr, "maya-ds4: %s\n", err.c_str());
                     return 1;

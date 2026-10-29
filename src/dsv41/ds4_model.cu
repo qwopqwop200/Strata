@@ -1001,6 +1001,8 @@ struct Model::Impl {
     // verify()'s rule - a point at the draft for the drafter's argmax; and the chain they were drawn with (verify()
     // checks it is its own)
     strata::dsv41k::SpecList* d_specq = nullptr;
+    double* d_spec_full = nullptr;
+    std::shared_ptr<Grammar> grammar;
     std::vector<strata::dsv41k::SpecList> h_specq = std::vector<strata::dsv41k::SpecList>(kWin);
     bool drafts_q = false;
     float dq_temp = 0.0f, dq_top_p = 1.0f, dq_min_p = 0.0f;
@@ -2696,6 +2698,14 @@ struct Model::Impl {
             if (g.n_mtp > 0 && (int) di == head_dev &&
                 (!dalloc(d, d_confv, kWin, err) || !dalloc(d, d_ints, 64, err) || !dalloc(d, d_specq, kWin, err)))
                 return false;
+            if (g.n_mtp > 0 && (int) di == head_dev) {
+                if (sample_drafts && !dalloc(d, d_spec_full, (size_t) kWin * (size_t) g.vocab, err)) return false;
+                for (int i=0;i<kWin;++i) {
+                    h_specq[(size_t)i].full=d_spec_full?d_spec_full+(size_t)i*g.vocab:nullptr;
+                    h_specq[(size_t)i].capacity=d_spec_full?g.vocab:0;
+                }
+                CK(cudaMemcpy(d_specq,h_specq.data(),(size_t)kWin*sizeof(strata::dsv41k::SpecList),cudaMemcpyHostToDevice));
+            }
             CK(cudaEventCreateWithFlags(&d.ev_out, cudaEventDisableTiming));
             cudaSetDevice(d.id);
             CK(cudaMemcpy(d.freqs_win, freqs_win.data(), freqs_win.size() * 4, cudaMemcpyHostToDevice));
@@ -7865,12 +7875,18 @@ struct Model::Impl {
                 sp.min_p = dq_min_p;
                 sp.seed = dq_seed;
             }
+            std::unique_ptr<Grammar> draft_grammar=(drafts_q && grammar)?std::make_unique<Grammar>(*grammar):nullptr;
             for (int i = 0; i < T; ++i) {   // the markov bias of the token before, then that position's draft
                 if (d_mk_head_q8 != nullptr) markov_add_q8(hd.logits + (size_t) i * V, d_mk_embed, d_mk_head_q8, d_ints + i, V, R, hd.st);
                 else markov_add(hd.logits + (size_t) i * V, d_mk_embed, d_mk_head, d_ints + i, V, R, hd.st);
                 if (drafts_q) {
+                    std::vector<uint8_t> mask;
+                    if(draft_grammar){mask=draft_grammar->allowed();sp.host_allowed=&mask;}
                     sp.counter = dq_counter + (uint64_t) i;
                     strata::dsv41k::sample_draft(hd.logits + (size_t) i * V, 1, V, sp, d_specq + i, d_ints + i + 1, hd.st);
+                    if(draft_grammar){int dt=-1;CK(cudaMemcpyAsync(&dt,d_ints+i+1,4,cudaMemcpyDeviceToHost,hd.st));CK(cudaStreamSynchronize(hd.st));
+                        if(!draft_grammar->accept(dt)){err="sampled draft violated grammar";return false;}}
+                    sp.host_allowed=nullptr;
                 } else
                     strata::dsv41k::sample_tokens(hd.logits + (size_t) i * V, 1, V, nullptr, 0, sp, d_ints + i + 1, hd.st);
             }
@@ -7923,6 +7939,8 @@ struct Model::Impl {
         sp.seed = seed;
         sp.counter = counter;
         sp.logit_bias = bias;
+        std::vector<uint8_t> mask;
+        if (grammar) { mask=grammar->allowed(); sp.host_allowed=&mask; }
         strata::dsv41k::sample_tokens(d.logits + (size_t) row * g.vocab, 1, g.vocab, nullptr, 0, sp, d.tok, d.st);
         int t = -1;
 #if defined(STRATA_METAL)
@@ -7930,6 +7948,7 @@ struct Model::Impl {
 #endif
         cudaMemcpyAsync(&t, d.tok, 4, cudaMemcpyDeviceToHost, d.st);
         cudaStreamSynchronize(d.st);
+        if (grammar && !grammar->accept(t)) throw std::runtime_error("sample violated native grammar");
         return t;
     }
 
@@ -7956,7 +7975,33 @@ struct Model::Impl {
         Dev& hd = devs[(size_t) head_dev];
         cudaSetDevice(hd.id);
         int m = 0;
-        if (temperature <= 0.0f) {
+        if (grammar) {
+            Grammar state=*grammar;
+            const bool own=drafts_q && dq_temp==temperature && dq_top_p==top_p && dq_top_k==top_k &&
+                           dq_min_p==min_p && dq_seed==seed && dq_counter==counter;
+            if (temperature>0 && !own) {
+                for(int i=0;i<n;++i) {h_specq[(size_t)i].n=1;h_specq[(size_t)i].ids[0]=drafts[(size_t)i];h_specq[(size_t)i].p[0]=1;}
+                CK(cudaMemcpyAsync(d_specq,h_specq.data(),(size_t)n*sizeof(strata::dsv41k::SpecList),cudaMemcpyHostToDevice,hd.st));
+            }
+            for(int i=0;i<n;++i)h_idx[i]=drafts[(size_t)i];
+            CK(cudaMemcpyAsync(d_ints+32,h_idx,(size_t)n*4,cudaMemcpyHostToDevice,hd.st));
+            for(int i=0;i<=n;++i) {
+                strata::dsv41k::SamplerParams sp;
+                sp.temperature=temperature;sp.greedy=temperature<=0;sp.top_p=top_p;sp.top_k=top_k;
+                sp.min_p=min_p;sp.seed=seed;sp.counter=counter+(uint64_t)i;
+                auto mask=state.allowed();sp.host_allowed=&mask;
+                if(temperature>0 && i<n)
+                    strata::dsv41k::sample_verify(hd.logits+(size_t)i*V,1,V,sp,d_specq+i,d_ints+32+i,d_ints+16,hd.st);
+                else strata::dsv41k::sample_tokens(hd.logits+(size_t)i*V,1,V,nullptr,0,sp,d_ints+16,hd.st);
+                int pick=-1;
+                CK(cudaMemcpyAsync(&pick,d_ints+16,4,cudaMemcpyDeviceToHost,hd.st));
+                CK(cudaStreamSynchronize(hd.st));
+                if(!state.accept(pick)){err="verify violated native grammar";return false;}
+                if(i<n && pick==drafts[(size_t)i]) {++m;continue;}
+                next=pick;break;
+            }
+            *grammar=std::move(state);
+        } else if (temperature <= 0.0f) {
             strata::dsv41k::SamplerParams sp;
             sp.greedy = true;
             sp.temperature = 0.0f;
@@ -10651,25 +10696,7 @@ struct Model::Impl {
     }
 
     int sample(float temperature, float top_p, int top_k, float min_p, uint64_t seed, uint64_t counter) {
-        Dev& d = devs[(size_t) head_dev];
-        cudaSetDevice(d.id);
-        strata::dsv41k::SamplerParams sp;
-        sp.temperature = temperature;
-        sp.greedy = temperature <= 0.0f;
-        sp.top_p = top_p;
-        sp.top_k = top_k;
-        sp.min_p = min_p;
-        sp.seed = seed;
-        sp.counter = counter;
-        strata::dsv41k::sample_tokens(d.logits + (size_t) std::max(0, n_logits - 1) * g.vocab, 1, g.vocab, nullptr, 0,
-                                       sp, d.tok, d.st);
-        int t = -1;
-#if defined(STRATA_METAL)
-        ds4_metal_flush();   // (a host read of a device result: commit the batched dispatches first)
-#endif
-        cudaMemcpyAsync(&t, d.tok, 4, cudaMemcpyDeviceToHost, d.st);
-        cudaStreamSynchronize(d.st);
-        return t;
+        return sample_row(std::max(0,n_logits-1),temperature,top_p,top_k,min_p,seed,counter,nullptr);
     }
 
     bool logits(std::vector<float>& out) {
@@ -10708,6 +10735,7 @@ struct Model::Impl {
                                    "cpu_experts=%d ram_experts=%d engine=ds4-0.1",
                       (long long) o.max_context, (long long) o.max_context, g.nl * g.n_exp - nh, nh, ram_held);
         v.push_back(b);
+        v.push_back("INFO full_vocab_sampling=1 json_schema_constraint=1 sampler_impl=native_host_full sampler_vocab="+std::to_string(g.vocab));
         if (commit_kept > 0) {   // (Windows, an integrated GPU: the commit kept experts off the GPU - the server says so)
             std::snprintf(b, sizeof b,
                           "NOTE experts: %.0f GB stay off the GPU - Windows' page file is too small to hold them there; "
@@ -10785,6 +10813,7 @@ int Model::feed_unit() const { return p_->chunk > 0 ? std::max(p_->chunk, (int) 
 void Model::set_progress(std::function<void(int64_t)> f) { p_->progress = std::move(f); }
 void Model::set_cancel(std::function<bool()> f) { p_->cancel = std::move(f); }
 bool Model::cancelled() const { return p_->halted; }
+void Model::set_grammar(std::shared_ptr<Grammar> grammar) {p_->grammar=std::move(grammar);}
 int Model::sample(float t, float tp, int tk, float mp, uint64_t seed, uint64_t counter) {
     return p_->sample(t, tp, tk, mp, seed, counter);
 }

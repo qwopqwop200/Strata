@@ -12,6 +12,7 @@
 // model altogether (another chat answered in between) is a slot: slot_save / slot_load take the same state - the
 // compressed KV and index keys included, which a checkpoint leaves in place - through a file or a host buffer.
 #pragma once
+#include "ds4_grammar.hpp"
 
 #include <cstddef>
 #include <cstdint>
@@ -124,6 +125,7 @@ public:
     int sample(float temperature, float top_p, int top_k, float min_p, uint64_t seed, uint64_t counter);
     /// The last feed's logit rows on the host (rows x vocab floats).
     bool logits(std::vector<float>& out);
+    void set_grammar(std::shared_ptr<Grammar> grammar);
 
     /// The DSpark drafter (speculative decoding): its block size (0: not loaded), drafts for the positions after `y`
     /// (y: the token at pos(), not fed yet) with their confidences, and the verification of [y, drafts]: how many of the
