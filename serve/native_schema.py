@@ -15,7 +15,9 @@ KEYS=ANNOTATIONS|{'type','properties','required','additionalProperties','items',
 class Compiler:
     def __init__(self):
         self.rules=[]
-        self.ws=self.new(); self.set(self.ws,[[],[self.rng(9,10),self.ws],[13,self.ws],[32,self.ws]])
+        # Bound formatting whitespace so a conflicting prompt cannot avoid the required JSON forever.
+        white=self.new([[self.rng(9,10)],[13],[32]])
+        self.ws=self.new([[]]+[[white]*n for n in range(1,5)])
         self.hex=self.new([[self.rng(48,57)],[self.rng(65,70)],[self.rng(97,102)]])
         self.digits=self.new();self.set(self.digits,[[],[self.rng(48,57),self.digits]])
         self.integer=self.new([[48],[self.rng(49,57),self.digits]])

@@ -3,6 +3,7 @@
 This local engine extension masks next-token logits before sampling. It does not add a schema prompt or repair
 the result. Thinking runs until the model emits its normal `</think>` token. Only the answer is JSON constrained.
 EOS is legal only after a complete JSON object. Incomplete output is an error, including a max-token cutoff.
+Formatting whitespace is limited to four characters at each grammar boundary to prevent whitespace-only loops.
 Structured streams retain the server's buffering policy. They deliver the exact generated JSON after a separate
 parse and schema check. They do not rewrite whitespace or escapes.
 

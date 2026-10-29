@@ -31,6 +31,7 @@
 #include <vector>
 #include <cstdio>
 #include <cstdlib>
+#include <atomic>
 
 namespace strata::dsv41k {
 namespace {
@@ -187,6 +188,14 @@ std::vector<double> distribution(const float*logits,int V,const int*history,int 
     auto h=history&&H>0?read_device(history,size_t(H),s):std::vector<int>{};
     return full_distribution(l,p,h);
 }
+void audit_distribution(const std::vector<double>&d,const SamplerParams&p,bool verify) {
+    static std::atomic<unsigned> seen{0};
+    const unsigned bit=1u<<((p.host_allowed?1:0)+(verify?2:0));
+    if(!(seen.fetch_or(bit)&bit))
+        std::fprintf(stderr,"ds4 native distribution: stage=%s actual_vocab=%zu positive=%zu sum=%.17g mask_applied=%d top_k=%d temperature=%g\n",
+                     verify?"verify":"draw",d.size(),size_t(std::count_if(d.begin(),d.end(),[](double x){return x>0;})),
+                     std::accumulate(d.begin(),d.end(),0.0),p.host_allowed!=nullptr,p.top_k,p.temperature);
+}
 } // namespace
 
 void sample_tokens(const float*logits,int T,int V,const int*history,int H,const SamplerParams&p,int*out,void*stream) {
@@ -201,7 +210,7 @@ void sample_tokens(const float*logits,int T,int V,const int*history,int H,const 
     }
     std::vector<int> picks(size_t(T),0);
     for(int t=0;t<T;++t){auto d=distribution(logits+size_t(t)*V,V,history?history+size_t(t)*H:nullptr,H,p,stream);
-        picks[t]=draw_distribution(d,full_uniform(p.seed,p.counter+uint64_t(t)));}
+        audit_distribution(d,p,false);picks[t]=draw_distribution(d,full_uniform(p.seed,p.counter+uint64_t(t)));}
     write_device(out,picks.data(),picks.size(),stream);
 }
 void sample_draft(const float*logits,int T,int V,const SamplerParams&p,SpecList*q,int*out,void*stream) {
@@ -219,7 +228,7 @@ void sample_draft(const float*logits,int T,int V,const SamplerParams&p,SpecList*
 void sample_verify(const float*logits,int T,int V,const SamplerParams&p,const SpecList*q,const int*draft,int*out,void*stream) {
     if(T<=0)return;
     auto meta=read_device(q,size_t(T),stream);auto drafts=read_device(draft,size_t(T),stream);std::vector<int> picks(size_t(T),0);
-    for(int t=0;t<T;++t){auto d=distribution(logits+size_t(t)*V,V,nullptr,0,p,stream);std::vector<double> dq(size_t(V),0);
+    for(int t=0;t<T;++t){auto d=distribution(logits+size_t(t)*V,V,nullptr,0,p,stream);audit_distribution(d,p,true);std::vector<double> dq(size_t(V),0);
         if(meta[t].n<0){if(meta[t].n!=-V || !meta[t].full || meta[t].capacity<V)throw std::runtime_error("invalid dense draft distribution");dq=read_device(meta[t].full,size_t(V),stream);}
         else {if(meta[t].n>64)throw std::runtime_error("invalid compact draft distribution");for(int i=0;i<meta[t].n;++i){int v=meta[t].ids[i];if(v<0 || v>=V)throw std::runtime_error("invalid draft token id");dq[v]=meta[t].p[i];}}
         auto c=p.counter+uint64_t(t);

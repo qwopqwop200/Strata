@@ -30,6 +30,7 @@ class NativeSchema(unittest.TestCase):
             self.assertEqual(self.probe({'type':'object'},text),'valid complete',text)
         for text in ['[]','{"a":01}','{"a":"bad\nraw"}','{"a":NaN}']:
             self.assertTrue(self.probe({'type':'object'},text).startswith('invalid'),text)
+        self.assertTrue(self.probe({'type':'object'},' '*5+'{}').startswith('invalid'))
 
     def test_unsupported_keywords_are_rejected_before_generation(self):
         for key,value in [('pattern','a'),('minimum',0),('$ref','#/$defs/x'),('oneOf',[])]:
