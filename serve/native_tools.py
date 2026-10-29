@@ -96,6 +96,7 @@ def compile_tools(tools, choice=None):
 def prepare(req,tools,svc):
     # Private transport keys are never trusted from clients, including tool_choice=none.
     req.pop('_native_tools',None)
+    req.pop('_native_schema_program',None)
     if any('strict' in t and type(t['strict']) is not bool for t in tools or []):
         raise ValueError('function.strict must be boolean')
     if not any(t.get('strict') is True for t in tools or []):return
@@ -115,7 +116,7 @@ def bind_segment(sampling,tok,prefix):
     Prefix KV restores and speculative overrun must never supply grammar state.
     """
     grammar=sampling.get('_native_tools')
-    if grammar is None:return sampling
+    if grammar is None:return native_schema.bind_segment(sampling,tok,prefix)
     key=('tools',id(tok))
     if key not in native_schema._vocab:
         types=tok.token_types or []
@@ -129,6 +130,6 @@ def bind_segment(sampling,tok,prefix):
     return {**sampling,'_native_grammar':str(path)}
 
 def release_segment(sampling):
-    if sampling.get('_native_tools') and sampling.get('_native_grammar'):
+    if (sampling.get('_native_tools') or sampling.get('_native_schema_program')) and sampling.get('_native_grammar'):
         path=Path(sampling['_native_grammar'])
         if path.parent==Path(native_schema._cache.name):path.unlink(missing_ok=True)

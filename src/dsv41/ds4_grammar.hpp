@@ -108,7 +108,8 @@ public:
         std::ifstream f(path,std::ios::binary);char magic[4]={};f.read(magic,4);
         auto get=[&](){int32_t x=0;f.read(reinterpret_cast<char*>(&x),4);if(!f)throw std::runtime_error("truncated grammar bundle");return int(x);};
         const bool tools=std::string(magic,4)=="SGT1";
-        if(!tools && std::string(magic,4)!="SGR1")throw std::runtime_error("invalid grammar bundle");
+        const bool replay=tools || std::string(magic,4)=="SGR2";
+        if(!replay && std::string(magic,4)!="SGR1")throw std::runtime_error("invalid grammar bundle");
         int V=get(),eos=get(),think=get(),wait=get(),N=get(),root=get();
         if(V!=expected_vocab || V<=0 || N<=0 || N>65536 || eos<0 || eos>=V || think<0 || think>=V || (wait!=0 && wait!=1))
             throw std::runtime_error("grammar vocabulary/header mismatch");
@@ -132,7 +133,7 @@ public:
         if(root<256 || root>=256+N)throw std::runtime_error("invalid grammar root");
         auto g=std::make_shared<Grammar>();g->p=prog;g->thinking=!tools && wait!=0;
         if(!tools)g->states=g->expand({{root}});
-        else {
+        if(replay) {
             int n=get();if(n<0 || n>1048576)throw std::runtime_error("invalid tool grammar prefix");
             for(int i=0;i<n;++i)if(!g->accept(get()))throw std::runtime_error("tool prefix violates grammar");
         }

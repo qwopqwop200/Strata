@@ -126,18 +126,21 @@ def compile_schema(schema):
     c=Compiler();root=c.new([[c.ws,c.value(schema)]])
     return {'rules':c.rules,'root':root}
 
-def write_bundle(path,grammar,tokens,eos,think_end,thinking,*,tool_prefix=None):
+def write_bundle(path,grammar,tokens,eos,think_end,thinking,*,tool_prefix=None,schema_prefix=None):
     """Length-prefixed bytes preserve split UTF-8 tokens; None bans control/special tokens in the answer."""
     with Path(path).open('wb') as f:
         def ints(*v):f.write(struct.pack('<'+'i'*len(v),*v))
-        f.write(b'SGR1' if tool_prefix is None else b'SGT1');ints(len(tokens),eos,think_end,int(bool(thinking)),len(grammar['rules']),grammar['root'])
+        if tool_prefix is not None and schema_prefix is not None:raise ValueError('conflicting grammar prefixes')
+        magic=b'SGT1' if tool_prefix is not None else (b'SGR2' if schema_prefix is not None else b'SGR1')
+        f.write(magic);ints(len(tokens),eos,think_end,int(bool(thinking)),len(grammar['rules']),grammar['root'])
         for token in tokens:
             ints(-1 if token is None else len(token))
             if token is not None:f.write(token)
         for rule in grammar['rules']:
             ints(len(rule))
             for seq in rule:ints(len(seq));ints(*seq)
-        if tool_prefix is not None:ints(len(tool_prefix));ints(*tool_prefix)
+        prefix=tool_prefix if tool_prefix is not None else schema_prefix
+        if prefix is not None:ints(len(prefix));ints(*prefix)
 
 _cache=tempfile.TemporaryDirectory(prefix='strata-native-grammar-')
 _vocab={}
@@ -150,6 +153,7 @@ class NativeValidator:
 def prepare_format(fmt,messages,svc,req,with_tools=False):
     from serve.structured import prepare_format as legacy
     req.pop('_native_grammar',None)
+    req.pop('_native_schema_program',None)
     if not isinstance(fmt,dict) or fmt.get('type') not in ('json_object','json_schema'):
         return legacy(fmt,messages,with_tools=with_tools,require_constraint=svc.require_strict_schema_constraint)
     if svc.model_arch!='deepseek41':
@@ -176,6 +180,16 @@ def bind_request(req,validator,tok,thinking):
     path=Path(_cache.name)/(key+'.bin')
     if not path.exists():write_bundle(path,validator.grammar,tokens,eos,end,thinking)
     req['_native_grammar']=str(path)
+    req['_native_schema_program']={'grammar':validator.grammar,'thinking':bool(thinking)}
+
+def bind_segment(sampling,tok,prefix):
+    program=sampling.get('_native_schema_program')
+    if program is None:return sampling
+    tokens,eos,end=_vocab[id(tok)]
+    key=hashlib.sha256(json.dumps([id(tok),program,list(prefix)],sort_keys=True).encode()).hexdigest()
+    path=Path(_cache.name)/(key+'.bin')
+    if not path.exists():write_bundle(path,program['grammar'],tokens,eos,end,program['thinking'],schema_prefix=prefix)
+    return {**sampling,'_native_grammar':str(path)}
 
 def validated_raw(text,validator,finish):
     from serve.structured import StructuredOutputError

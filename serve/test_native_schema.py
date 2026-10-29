@@ -69,4 +69,17 @@ class NativeSchema(unittest.TestCase):
         self.assertEqual(sampling_defaults_from_config({'arch':'deepseek41','sampling':{'top_k':0}})['top_k'],0)
         self.assertEqual(clean_shared_defaults({'top_k':129280},'deepseek41')['top_k'],129280)
 
-if __name__=='__main__': unittest.main()
+
+class NativeSchemaResume(unittest.TestCase):
+    def test_budget_continuation_replays_think_end_and_partial_json(self):
+        text=json.dumps({'name':'한글"\\끝','data':[{'ok':True}]},ensure_ascii=False,separators=(',',':'))
+        rules=compile_schema(OBJECT)
+        for split in (1,text.index('한글')+1,len(text)-3):
+            with tempfile.TemporaryDirectory() as d:
+                p=Path(d)/'resume.bin'
+                prefix=[257]+list(text[:split].encode())
+                write_bundle(p,rules,[bytes([i]) for i in range(256)]+[None,None],256,257,True,schema_prefix=prefix)
+                result=subprocess.check_output([os.environ['GRAMMAR_PROBE'],str(p),text[split:].encode().hex()],text=True).strip()
+                self.assertEqual(result,'valid complete')
+
+if __name__=="__main__": unittest.main()
